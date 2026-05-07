@@ -1,0 +1,18 @@
+module PDFApp {
+    exception PDFException {
+        string why;
+    };
+
+    typedef sequence<octet> PDFData;
+
+    interface PDFService {
+        // Services demandés sur le schéma
+        PDFData creerPDF(in string titre, in string contenu) raises (PDFException);
+        PDFData fusionnerPDF(in PDFData pdf1, in PDFData pdf2) raises (PDFException);
+        PDFData decouperPDF(in PDFData pdf, in long pageDebut, in long pageFin) raises (PDFException);
+        string extraireTexte(in PDFData pdf) raises (PDFException);
+        PDFData supprimerPages(in PDFData pdf, in long numeroPage) raises (PDFException);
+        PDFData ajouterMotDePasse(in PDFData pdf, in string password) raises (PDFException);
+        // Bonus : Conversion (si besoin plus tard)
+    };
+};

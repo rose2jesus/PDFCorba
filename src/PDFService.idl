@@ -1,0 +1,78 @@
+module PDFApp
+{
+    exception PDFException
+    {
+        string message;
+    };
+
+    typedef sequence<octet> PDFData;
+    typedef sequence<PDFData> PDFList;
+    typedef sequence<long> PageList;
+
+    interface PDFService
+    {
+        // Fusion de plusieurs PDFs en un seul
+        PDFData fusionnerPDFs(in PDFList pdfs)
+            raises (PDFException);
+
+        // Découpage d'un PDF en plusieurs
+        PDFList decouperPDF(in PDFData pdf, in long nbPages)
+            raises (PDFException);
+
+        // Extraction de pages spécifiques
+        PDFData extrairePages(in PDFData pdf, in PageList pages)
+            raises (PDFException);
+
+        // Suppression de pages
+        PDFData supprimerPages(in PDFData pdf, in PageList pages)
+            raises (PDFException);
+
+        // Ajout de mot de passe
+        PDFData ajouterMotDePasse(in PDFData pdf, in string motDePasse)
+            raises (PDFException);
+
+        // Conversion PDF en images (retourne liste d'images PNG)
+        PDFList convertirEnImages(in PDFData pdf, in long dpi)
+            raises (PDFException);
+
+        // Extraction de texte
+        string extraireTexte(in PDFData pdf)
+            raises (PDFException);
+
+        // Création d'un PDF depuis du texte
+        PDFData creerPDF(in string titre, in string contenu)
+            raises (PDFException);
+	// Compression du PDF
+        PDFData compresserPDF(in PDFData pdf)
+            raises (PDFException);
+
+        // Lire les métadonnées
+        string lireMetadonnees(in PDFData pdf)
+            raises (PDFException);
+
+        // Modifier les métadonnées
+        PDFData modifierMetadonnees(
+            in PDFData pdf,
+            in string titre,
+            in string auteur,
+            in string sujet
+        ) raises (PDFException);
+
+        // Ajouter un QR Code
+        PDFData ajouterQRCode(
+            in PDFData pdf,
+            in string contenu,
+            in long page,
+            in long x,
+            in long y
+        ) raises (PDFException);
+
+        // Signature numérique
+        PDFData signerPDF(
+            in PDFData pdf,
+            in string nomSignataire,
+            in string raison,
+            in string lieu
+        ) raises (PDFException);
+    };
+};

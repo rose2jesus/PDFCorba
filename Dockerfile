@@ -24,7 +24,7 @@ EXPOSE 8080
 # pour empêcher le conteneur de se fermer.
 CMD ["sh", "-c", \
      "orbd -ORBInitialPort 1050 & \
-      sleep 5 && \
+      sleep 15 && \
       java -cp bin:lib/* PDFServer.StartServer -ORBInitialPort 1050 -ORBInitialHost localhost & \
-      sleep 5 && \
+      sleep 20 && \
       java -cp bin:lib/* PDFServer.PDFWebGateway -ORBInitialPort 1050 -ORBInitialHost localhost"]

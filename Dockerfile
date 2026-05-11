@@ -5,19 +5,16 @@ COPY src/ ./src/
 COPY lib/ ./lib/
 RUN mkdir -p bin
 
-# Compilation
-RUN javac -d bin -cp "lib/*" \
-    src/PDFApp/*.java \
-    src/PDFServer/PDFServiceImpl.java \
-    src/PDFServer/PDFWebGateway.java \
-    src/PDFServer/StartServer.java
+# Compilation : On compile tout le dossier src pour éviter les erreurs de dépendances
+RUN javac -d bin -cp "lib/*" src/PDFApp/*.java src/PDFServer/*.java
 
-EXPOSE 8080
+# On ne force pas EXPOSE 8080, Render s'en occupe.
 
-# Commande de lancement avec délais de sécurité maximum pour Render
+# Commande de lancement optimisée
+# On termine par le Gateway SANS le '&' pour que le conteneur reste actif.
 CMD ["sh", "-c", \
      "orbd -ORBInitialPort 1050 & \
-      sleep 20 && \
+      sleep 10 && \
       java -cp bin:lib/* PDFServer.StartServer -ORBInitialPort 1050 -ORBInitialHost localhost & \
-      sleep 30 && \
+      sleep 15 && \
       java -cp bin:lib/* PDFServer.PDFWebGateway -ORBInitialPort 1050 -ORBInitialHost localhost"]

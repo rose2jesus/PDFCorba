@@ -12,19 +12,17 @@ import org.omg.CORBA.*;
 
 public class PDFWebGateway {
     private static PDFService pdfRef;
-    
-    // Base de données simulée (Username -> Password)
+
     private static final Map<String, String> USERS = new HashMap<String, String>() {{
         put("admin", "admin123");
     }};
     private static final Map<String, String> ROLES = new HashMap<String, String>() {{
         put("admin", "ADMIN");
     }};
-    private static final Map<String, String> SESSIONS = new HashMap<>(); // SID -> Role
-    private static final Map<String, String> SESSION_USER = new HashMap<>(); // SID -> Username
+    private static final Map<String, String> SESSIONS = new HashMap<>(); 
+    private static final Map<String, String> SESSION_USER = new HashMap<>(); 
 
-    // ── DESIGN PREMIUM (Pastels, Dégradés, Glassmorphism) ──────────────────
-    static final String CSS = 
+    static final String CSS =
         "@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap');" +
         ":root { --primary: #6366f1; --bg: #f8fafc; --card: #ffffff; }" +
         "body{font-family:'Plus Jakarta Sans',sans-serif; background:var(--bg); margin:0; display:flex; color:#1e293b;}" +
@@ -45,24 +43,40 @@ public class PDFWebGateway {
         ".btn-auth{background:#6366f1; color:white; border:none; padding:14px; border-radius:12px; width:100%; font-weight:700; cursor:pointer; margin-top:10px;}";
 
     public static void main(String[] args) throws Exception {
-        HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+        // --- CONNEXION CORBA ---
+        try {
+            ORB orb = ORB.init(args, null);
+            org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
+            NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
+            pdfRef = PDFServiceHelper.narrow(ncRef.resolve_str("PDFService"));
+        } catch (Exception e) {
+            System.err.println("Note: Serveur CORBA non joint : " + e.getMessage());
+        }
+
+        // --- CONFIGURATION PORT RENDER ---
+        String portEnv = System.getenv("PORT");
+        int port = (portEnv != null) ? Integer.parseInt(portEnv) : 8080;
+
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.createContext("/", new LoginPageHandler());
         server.createContext("/register", new RegisterPageHandler());
         server.createContext("/do-login", new LoginActionHandler());
         server.createContext("/do-register", new RegisterActionHandler());
         server.createContext("/home", new HomeHandler());
         server.createContext("/logout", new LogoutHandler());
+        
         server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(10));
-        System.out.println("🚀 Studio PDF Premium lancé : http://localhost:8080");
+        System.out.println("🚀 Studio PDF Premium lancé sur le port : " + port);
         server.start();
     }
 
-    // ── PAGE DE CONNEXION ───────────────────────────────────────
+    // [Garde tout le reste de tes handlers (LoginPage, HomeHandler, etc.) exactement comme avant]
+    
     static class LoginPageHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
             String html = "<html><head><style>" + CSS + "body{display:flex;align-items:center;justify-content:center;height:100vh;background:#EEF2FF;}</style></head><body>" +
                 "<div class='login-container'> <div class='logo'>Studio PDF</div> <h2>Connexion</h2>" +
-                "<form action='/do-login' method='POST'><input name='username' placeholder='Nom d utilisateur' required>" +
+                "<form action='/do-login' method='POST'><input name='username' placeholder='Nom d utilisateur' required autofocus>" +
                 "<input name='password' type='password' placeholder='Mot de passe' required>" +
                 "<button type='submit' class='btn-auth'>Se connecter</button></form>" +
                 "<p style='font-size:14px; color:#64748b'>Pas de compte ? <a href='/register' style='color:#6366f1;text-decoration:none;font-weight:600'>Créer un compte</a></p></div></body></html>";
@@ -70,7 +84,6 @@ public class PDFWebGateway {
         }
     }
 
-    // ── PAGE D'INSCRIPTION ──────────────────────────────────────
     static class RegisterPageHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
             String html = "<html><head><style>" + CSS + "body{display:flex;align-items:center;justify-content:center;height:100vh;background:#F5F3FF;}</style></head><body>" +
@@ -83,7 +96,6 @@ public class PDFWebGateway {
         }
     }
 
-    // ── TABLEAU DE BORD (HOME) ──────────────────────────────────
     static class HomeHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
             String sid = getSessionId(t);
@@ -130,7 +142,6 @@ public class PDFWebGateway {
         }
     }
 
-    // ── ACTIONS (LOGIN / REGISTER) ──────────────────────────────
     static class LoginActionHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
             Map<String, String> p = parseForm(new String(t.getRequestBody().readAllBytes()));
@@ -149,7 +160,7 @@ public class PDFWebGateway {
         public void handle(HttpExchange t) throws IOException {
             Map<String, String> p = parseForm(new String(t.getRequestBody().readAllBytes()));
             String u = p.get("username"), pass = p.get("password");
-            if (!u.isEmpty() && !USERS.containsKey(u)) {
+            if (u != null && !u.isEmpty() && !USERS.containsKey(u)) {
                 USERS.put(u, pass);
                 ROLES.put(u, "USER");
                 redirect(t, "/");
@@ -157,7 +168,6 @@ public class PDFWebGateway {
         }
     }
 
-    // ── UTILS ───────────────────────────────────────────────────
     static void redirect(HttpExchange t, String url) throws IOException {
         t.getResponseHeaders().set("Location", url);
         t.sendResponseHeaders(302, -1);

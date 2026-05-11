@@ -14,6 +14,6 @@ EXPOSE 8080
 
 # Commande de lancement robuste
 # On utilise 'wait' pour s'assurer que le conteneur reste actif tant que la Gateway tourne
-CMD sh -c "orbd -ORBInitialPort 1050 & sleep 5 && \
+CMD sh -c "orbd -ORBInitialPort 1050 & sleep 15 && \
     java -cp bin:lib/* PDFServer.StartServer -ORBInitialPort 1050 & sleep 5 && \
     java -cp bin:lib/* PDFServer.PDFWebGateway"

@@ -12,22 +12,48 @@ import org.omg.CORBA.*;
 
 public class PDFWebGateway {
     private static PDFService pdfRef;
-    private static int nbCrees = 128, nbExtractions = 64, nbFusions = 32, nbProtections = 16;
+    
+    // Statistiques de session (Simulées pour la démo)
+    private static int totalActions = 0;
 
-    // Gestion des utilisateurs et sessions
-    private static Map<String, String> userDatabase = new HashMap<>();
-    private static Set<String> admins = new HashSet<>();
-    private static Map<String, String> sessions = new HashMap<>();
-    private static final String USERS_FILE = "users.txt";
+    // ── GESTION DES SESSIONS & UTILISATEURS ──────────────────────────
+    private static final Map<String, String> SESSIONS = new HashMap<>(); // SID -> Role
+    private static final Map<String, String> SESSION_USER = new HashMap<>(); // SID -> Email
+    
+    private static final Map<String, String> USERS = new HashMap<String, String>() {{
+        put("admin@pdf.com", "admin123");
+        put("etudiant@ussein.sn", "pass123");
+    }};
+    
+    private static final Map<String, String> ROLES = new HashMap<String, String>() {{
+        put("admin@pdf.com", "ADMIN");
+        put("etudiant@ussein.sn", "USER");
+    }};
 
-    static {
-        // Compte administrateur par défaut
-        userDatabase.put("admin", "pass123");
-        admins.add("admin");
+    // ── HELPERS DE SESSION ───────────────────────────────────────
+    static String getSessionId(HttpExchange t) {
+        String cookie = t.getRequestHeaders().getFirst("Cookie");
+        if (cookie == null) return null;
+        for (String c : cookie.split(";")) {
+            c = c.trim();
+            if (c.startsWith("session=")) return c.substring(8);
+        }
+        return null;
     }
 
+    static boolean isLoggedIn(HttpExchange t) {
+        String sid = getSessionId(t);
+        return sid != null && SESSIONS.containsKey(sid);
+    }
+
+    static void redirect(HttpExchange t, String url) throws IOException {
+        t.getResponseHeaders().set("Location", url);
+        t.sendResponseHeaders(302, -1);
+        t.getResponseBody().close();
+    }
+
+    // ── MAIN ─────────────────────────────────────────────────────
     public static void main(String[] args) throws Exception {
-        chargerUtilisateurs();
         try {
             ORB orb = ORB.init(args, null);
             org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
@@ -36,209 +62,168 @@ public class PDFWebGateway {
 
             HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
 
-            // Routes Authentification
-            server.createContext("/login",    new LoginHandler());
-            server.createContext("/register", new RegisterHandler());
-            server.createContext("/logout",   new LogoutHandler());
-
-            // Routes Application (Protégées par checkAuth)
-            server.createContext("/",         new UIHandler());
-            server.createContext("/extract",  new ExtractHandler());
-            // Ajoute ici tes autres contexts (merge, protect, etc.)
-
+            server.createContext("/",         new LoginPageHandler());
+            server.createContext("/login",     new LoginHandler());
+            server.createContext("/logout",    new LogoutHandler());
+            server.createContext("/home",      new HomeHandler());
+            
+            // Les autres routes (create, extract, etc.) pointeraient vers leurs handlers respectifs
+            
             server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(10));
-            System.out.println("Studio PDF CORBA Connecté -> http://localhost:8080");
+            System.out.println("Gateway Studio PDF lancé sur http://localhost:8080");
             server.start();
         } catch (Exception e) {
-            e.printStackTrace();
+            System.err.println("Erreur CORBA/Serveur : " + e.getMessage());
         }
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  SÉCURITÉ & PERSISTANCE
-    // ══════════════════════════════════════════════════════════
-    private static void chargerUtilisateurs() {
-        File f = new File(USERS_FILE);
-        if (!f.exists()) return;
-        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
-            String l;
-            while ((l = br.readLine()) != null) {
-                String[] p = l.split(":", 2);
-                if (p.length == 2) userDatabase.put(p[0], p[1]);
-            }
-        } catch (IOException e) {}
-    }
+    // ══════════════════════════════════════════════════════
+    //  CSS & UI COMPONENTS
+    // ══════════════════════════════════════════════════════
+    static final String CSS = 
+        "<style>" +
+        "body{font-family:'Inter',sans-serif; background:#F5F3FF; margin:0;}" +
+        ".topbar{background:#4F1D96; color:white; padding:15px 30px; display:flex; justify-content:space-between; align-items:center;}" +
+        ".main{max-width:1100px; margin:30px auto; padding:0 20px;}" +
+        ".admin-monitor{background:#FFFBEB; border:1.5px solid #FDE68A; padding:20px; border-radius:15px; margin-bottom:25px; color:#92400E;}" +
+        ".grid{display:grid; grid-template-columns:repeat(4,1fr); gap:15px;}" +
+        ".card{background:white; padding:20px; border-radius:12px; box-shadow:0 4px 6px rgba(0,0,0,0.05); text-align:center; transition:0.3s; cursor:pointer;}" +
+        ".card:hover{transform:translateY(-5px); box-shadow:0 10px 15px rgba(79,29,150,0.1); border:1px solid #7C3AED;}" +
+        ".btn-logout{color:white; text-decoration:none; border:1px solid rgba(255,255,255,0.4); padding:7px 15px; border-radius:8px; font-size:13px;}" +
+        ".status-badge{background:#10B981; color:white; padding:2px 8px; border-radius:10px; font-size:11px;}" +
+        "</style>";
 
-    private static synchronized void sauvegarderUtilisateurs() {
-        try (PrintWriter out = new PrintWriter(new FileWriter(USERS_FILE))) {
-            for (Map.Entry<String, String> e : userDatabase.entrySet()) 
-                out.println(e.getKey() + ":" + e.getValue());
-        } catch (IOException e) {}
-    }
-
-    static String getUsername(HttpExchange t) {
-        String cookie = t.getRequestHeaders().getFirst("Cookie");
-        if (cookie != null && cookie.contains("session=")) {
-            String sid = cookie.split("session=")[1].split(";")[0];
-            return sessions.get(sid);
+    // ══════════════════════════════════════════════════════
+    //  HANDLERS
+    // ══════════════════════════════════════════════════════
+    
+    static class LoginPageHandler implements HttpHandler {
+        public void handle(HttpExchange t) throws IOException {
+            if (isLoggedIn(t)) { redirect(t, "/home"); return; }
+            String html = "<html><head><style>" +
+                "body{background:#6D28D9; display:flex; align-items:center; justify-content:center; height:100vh; font-family:sans-serif;}" +
+                ".login-box{background:white; padding:40px; border-radius:20px; width:320px; text-align:center;}" +
+                "input{width:100%; padding:12px; margin:10px 0; border:1px solid #DDD; border-radius:10px;}" +
+                "button{width:100%; padding:12px; background:#4F1D96; color:white; border:none; border-radius:10px; cursor:pointer;}" +
+                "</style></head><body><div class='login-box'><h2>Studio PDF</h2>" +
+                "<form action='/login' method='POST'>" +
+                "<input name='email' placeholder='Email USSEIN' required>" +
+                "<input name='password' type='password' placeholder='Mot de passe' required>" +
+                "<button type='submit'>Se connecter</button></form></div></body></html>";
+            sendHtml(t, html);
         }
-        return null;
     }
 
-    static boolean checkAuth(HttpExchange t) throws IOException {
-        String user = getUsername(t);
-        if (user != null) return true;
-        t.getResponseHeaders().set("Location", "/login");
-        t.sendResponseHeaders(303, -1);
-        return false;
-    }
-
-    // ══════════════════════════════════════════════════════════
-    //  HANDLERS AUTHENTIFICATION
-    // ══════════════════════════════════════════════════════════
     static class LoginHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
-            if ("POST".equalsIgnoreCase(t.getRequestMethod())) {
-                Map<String, String> p = parseQuery(new String(readAllBytes(t.getRequestBody())));
-                String u = p.get("user"), pw = p.get("pass");
-                if (pw != null && pw.equals(userDatabase.get(u))) {
-                    String sid = UUID.randomUUID().toString();
-                    sessions.put(sid, u);
-                    t.getResponseHeaders().add("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
-                    t.getResponseHeaders().set("Location", "/");
-                    t.sendResponseHeaders(303, -1);
-                    return;
-                }
+            String body = new String(readAllBytes(t.getRequestBody()), StandardCharsets.UTF_8);
+            Map<String, String> params = parseForm(body);
+            String email = params.get("email");
+            String pass = params.get("password");
+
+            if (USERS.containsKey(email) && USERS.get(email).equals(pass)) {
+                String sid = UUID.randomUUID().toString();
+                SESSIONS.put(sid, ROLES.get(email));
+                SESSION_USER.put(sid, email);
+                t.getResponseHeaders().add("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
+                redirect(t, "/home");
+            } else {
+                redirect(t, "/?error=1");
             }
-            renderAuthPage(t, "Connexion", false);
         }
     }
 
-    static class RegisterHandler implements HttpHandler {
+    static class HomeHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
-            if ("POST".equalsIgnoreCase(t.getRequestMethod())) {
-                Map<String, String> p = parseQuery(new String(readAllBytes(t.getRequestBody())));
-                String u = p.get("user"), pw = p.get("pass");
-                if (u != null && !userDatabase.containsKey(u)) {
-                    userDatabase.put(u, pw);
-                    sauvegarderUtilisateurs();
-                    t.getResponseHeaders().set("Location", "/login");
-                    t.sendResponseHeaders(303, -1);
-                    return;
-                }
+            if (!isLoggedIn(t)) { redirect(t, "/"); return; }
+            
+            String sid = getSessionId(t);
+            String role = SESSIONS.get(sid);
+            String userEmail = SESSION_USER.get(sid);
+            boolean isAdmin = "ADMIN".equals(role);
+
+            StringBuilder html = new StringBuilder();
+            html.append("<html><head><meta charset='UTF-8'>").append(CSS).append("</head><body>");
+            
+            // BARRE SUPÉRIEURE
+            html.append("<div class='topbar'>")
+                .append("<span><b>STUDIO PDF</b> | ").append(userEmail).append("</span>")
+                .append("<a href='/logout' class='btn-logout'>Déconnexion</a>")
+                .append("</div>");
+
+            html.append("<div class='main'>");
+
+            // MONITORING ADMIN (Uniquement si ADMIN)
+            if (isAdmin) {
+                html.append("<div class='admin-monitor'>")
+                    .append("<h3><span style='margin-right:10px;'>📊</span> Supervision Administrateur</h3>")
+                    .append("<div style='display:flex; gap:30px;'>")
+                    .append("<div>Utilisateurs en ligne : <b>").append(SESSIONS.size()).append("</b></div>")
+                    .append("<div>Actions Serveur : <b>").append(totalActions).append("</b></div>")
+                    .append("<div>Serveur CORBA : <span class='status-badge'>OPÉRATIONNEL</span></div>")
+                    .append("</div>")
+                    .append("<div style='margin-top:10px; font-size:12px;'>Dernier connecté : ").append(userEmail).append("</div>")
+                    .append("</div>");
             }
-            renderAuthPage(t, "Inscription", true);
+
+            // GRILLE DES 12 OUTILS (Pour TOUT LE MONDE)
+            html.append("<h2>Mes Outils PDF</h2>")
+                .append("<div class='grid'>")
+                .append(toolCard("Extraire Texte", "Analyse"))
+                .append(toolCard("PDF vers Images", "Conversion"))
+                .append(toolCard("Protéger (MDP)", "Sécurité"))
+                .append(toolCard("Fusionner PDFs", "Assemblage"))
+                .append(toolCard("Découper", "Édition"))
+                .append(toolCard("Supprimer Pages", "Édition"))
+                .append(toolCard("Extraire Pages", "Extraction"))
+                .append(toolCard("Compresser", "Optimisation"))
+                .append(toolCard("Métadonnées", "Information"))
+                .append(toolCard("Modifier Meta", "Édition"))
+                .append(toolCard("Ajouter QR Code", "Enrichissement"))
+                .append(toolCard("Signer (RSA)", "Sécurité"))
+                .append("</div>");
+
+            html.append("</div></body></html>");
+            sendHtml(t, html.toString());
+        }
+
+        private String toolCard(String name, String cat) {
+            return "<div class='card'><div style='font-size:10px; color:#6D28D9; font-weight:700; margin-bottom:5px;'>" + cat.toUpperCase() + "</div>"
+                 + "<h3>" + name + "</h3><p style='font-size:12px; color:#9CA3AF;'>Lancer l'outil</p></div>";
         }
     }
 
     static class LogoutHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
+            String sid = getSessionId(t);
+            if (sid != null) { SESSIONS.remove(sid); SESSION_USER.remove(sid); }
             t.getResponseHeaders().add("Set-Cookie", "session=; Path=/; Max-Age=0; HttpOnly");
-            t.getResponseHeaders().set("Location", "/login");
-            t.sendResponseHeaders(303, -1);
+            redirect(t, "/");
         }
     }
 
-    private static void renderAuthPage(HttpExchange t, String title, boolean isReg) throws IOException {
-        String action = isReg ? "/register" : "/login";
-        String link = isReg ? "/login" : "/register";
-        String linkText = isReg ? "Déjà un compte ? Connexion" : "Pas de compte ? S'inscrire";
-        
-        String html = "<html><head><title>"+title+"</title><style>"
-            + "body{margin:0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#F5F3FF}"
-            + ".card{background:#fff;padding:40px;border-radius:20px;width:320px;box-shadow:0 10px 25px rgba(0,0,0,0.05)}"
-            + "input{width:100%;padding:12px;margin:10px 0;border:1px solid #EDE9FE;border-radius:8px;outline:none}"
-            + ".btn{width:100%;background:#7C3AED;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:600;cursor:pointer;margin-top:10px}"
-            + "a{display:block;text-align:center;margin-top:15px;font-size:12px;color:#7C3AED;text-decoration:none}</style></head>"
-            + "<body><div class='card'><h2>"+title+"</h2><form method='POST' action='"+action+"'>"
-            + "User<input name='user' required>Pass<input name='pass' type='password' required>"
-            + "<button class='btn'>Entrer</button></form><a href='"+link+"'>"+linkText+"</a></div></body></html>";
-        sendHtml(t, html);
-    }
-
-    // ══════════════════════════════════════════════════════════
-    //  INTERFACE STUDIO (UI)
-    // ══════════════════════════════════════════════════════════
-    static class UIHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!checkAuth(t)) return;
-            String user = getUsername(t);
-            boolean isAdmin = admins.contains(user);
-
-            String html = "<html><head><meta charset='UTF-8'><style>"
-                + "*{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif}"
-                + "body{background:#F8F9FD} .topbar{background:#4F1D96;padding:40px 20px 80px;color:#fff;text-align:center}"
-                + ".nav-top{display:flex;justify-content:space-between;max-width:1100px;margin: -30px auto 20px;padding:0 20px}"
-                + ".container{max-width:1100px;margin:0 auto;padding:0 20px}"
-                + ".stats{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-top:-60px;margin-bottom:30px}"
-                + ".stat{background:#fff;padding:20px;border-radius:8px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-top:4px solid #7C3AED}"
-                + ".tools{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}"
-                + ".tc{background:#fff;padding:30px;border-radius:8px;text-align:center;cursor:pointer;transition:0.2s;border-top:4px solid #DDD6FE}"
-                + ".tc:hover{transform:translateY(-3px);box-shadow:0 10px 20px rgba(0,0,0,0.05)}"
-                + ".admin-sec{background:#FEF2F2;padding:20px;border-radius:8px;margin-bottom:20px;border:1px solid #FEE2E2;color:#991B1B}"
-                + ".logout{color:#fff;text-decoration:none;font-size:12px;border:1px solid rgba(255,255,255,0.4);padding:5px 12px;border-radius:4px}"
-                + ".overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:100;align-items:center;justify-content:center}"
-                + ".active{display:flex} .modal{background:#fff;padding:30px;border-radius:12px;width:350px}"
-                + "</style></head><body>"
-                + "<div class='topbar'><h1>Studio PDF CORBA</h1><p>Connecté en tant que: <b>"+user+"</b></p></div>"
-                + "<div class='nav-top'><div style='width:1px'></div><a href='/logout' class='logout'>Déconnexion</a></div>"
-                + "<div class='container'>"
-                + "<div class='stats'>"
-                + "<div class='stat'><h3>"+nbCrees+"</h3><p>Créés</p></div><div class='stat'><h3>"+nbExtractions+"</h3><p>Extractions</p></div>"
-                + "<div class='stat'><h3>"+nbFusions+"</h3><p>Fusions</p></div><div class='stat'><h3>"+nbProtections+"</h3><p>Protégés</p></div>"
-                + "</div>"
-                + (isAdmin ? "<div class='admin-sec'><b>Outils Administrateur</b><br>Gestion des logs et serveurs CORBA active.</div>" : "")
-                + "<div class='tools'>"
-                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#A78BFA'><h3>Extraire Texte</h3></div>"
-                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#7DD3FC'><h3>Images</h3></div>"
-                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#34D399'><h3>Protéger</h3></div>"
-                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#FBBF24'><h3>Fusionner</h3></div>"
-                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#F472B6'><h3>QR Code</h3></div>"
-                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#2DD4BF'><h3>Signer</h3></div>"
-                + "</div></div>"
-                + "<div id='m1' class='overlay'><div class='modal'><h2>Action PDF</h2><form method='POST' enctype='multipart/form-data' action='/extract'><input type='file' name='doc' required><br><br><button style='width:100%;padding:10px;background:#7C3AED;color:white;border:none;border-radius:6px'>Lancer</button><button type='button' onclick='closeM(\"m1\")' style='width:100%;background:none;border:none;margin-top:10px;color:#999'>Annuler</button></form></div></div>"
-                + "<script>function openM(id){document.getElementById(id).classList.add('active')} function closeM(id){document.getElementById(id).classList.remove('active')}</script>"
-                + "</body></html>";
-            sendHtml(t, html);
-        }
-    }
-
-    // HANDLER TECHNIQUE EXEMPLE
-    static class ExtractHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!checkAuth(t)) return;
-            try {
-                byte[] pdf = parseMultipart(t).files.values().iterator().next();
-                String res = pdfRef.extraireTexte(pdf);
-                nbExtractions++;
-                sendHtml(t, "<h3>Résultat :</h3><pre>"+res+"</pre><a href='/'>Retour</a>");
-            } catch (Exception e) { sendHtml(t, "Erreur"); }
-        }
-    }
-
-    // UTILS
-    static void sendHtml(HttpExchange t, String h) throws IOException {
-        byte[] b = h.getBytes(StandardCharsets.UTF_8);
+    // ── UTILS ────────────────────────────────────────────────────
+    static void sendHtml(HttpExchange t, String html) throws IOException {
+        byte[] b = html.getBytes(StandardCharsets.UTF_8);
         t.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
         t.sendResponseHeaders(200, b.length);
-        t.getResponseBody().write(b); t.getResponseBody().close();
+        t.getResponseBody().write(b);
+        t.getResponseBody().close();
     }
-    static byte[] readAllBytes(InputStream is) throws IOException { ByteArrayOutputStream b = new ByteArrayOutputStream(); byte[] buf = new byte[8192]; int n; while((n=is.read(buf))!=-1) b.write(buf,0,n); return b.toByteArray(); }
-    static Map<String,String> parseQuery(String q) { Map<String,String> m = new HashMap<>(); if(q==null) return m; for(String s : q.split("&")){String[] kv=s.split("=",2); if(kv.length>1) m.put(kv[0], kv[1]);} return m; }
-    static class MultipartData { Map<String,byte[]> files = new HashMap<>(); }
-    static MultipartData parseMultipart(HttpExchange t) throws Exception {
-        MultipartData mp = new MultipartData();
-        String ct = t.getRequestHeaders().getFirst("Content-Type");
-        String boundary = "--" + ct.split("boundary=")[1].trim();
-        String raw = new String(readAllBytes(t.getRequestBody()), "ISO-8859-1");
-        for (String part : raw.split(java.util.regex.Pattern.quote(boundary))) {
-            if (part.contains("filename=")) {
-                String name = part.split("name=\"")[1].split("\"")[0];
-                int start = part.indexOf("\r\n\r\n") + 4;
-                int end = part.lastIndexOf("\r\n");
-                mp.files.put(name, part.substring(start, end).getBytes("ISO-8859-1"));
-            }
+
+    static Map<String, String> parseForm(String query) throws UnsupportedEncodingException {
+        Map<String, String> result = new HashMap<>();
+        for (String param : query.split("&")) {
+            String[] pair = param.split("=");
+            if (pair.length > 1) result.put(pair[0], URLDecoder.decode(pair[1], "UTF-8"));
         }
-        return mp;
+        return result;
+    }
+
+    static byte[] readAllBytes(InputStream is) throws IOException {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        int nRead; byte[] data = new byte[16384];
+        while ((nRead = is.read(data, 0, data.length)) != -1) buffer.write(data, 0, nRead);
+        return buffer.toByteArray();
     }
 }

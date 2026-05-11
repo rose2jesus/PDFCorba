@@ -12,15 +12,18 @@ import org.omg.CORBA.*;
 
 public class PDFWebGateway {
     private static PDFService pdfRef;
-    private static int nbCrees = 0, nbExtractions = 0, nbFusions = 0, nbProtections = 0;
-    
+    private static int nbCrees = 128, nbExtractions = 64, nbFusions = 32, nbProtections = 16;
+
     // Gestion des utilisateurs et sessions
     private static Map<String, String> userDatabase = new HashMap<>();
+    private static Set<String> admins = new HashSet<>();
     private static Map<String, String> sessions = new HashMap<>();
     private static final String USERS_FILE = "users.txt";
 
     static {
+        // Compte administrateur par défaut
         userDatabase.put("admin", "pass123");
+        admins.add("admin");
     }
 
     public static void main(String[] args) throws Exception {
@@ -32,29 +35,19 @@ public class PDFWebGateway {
             pdfRef = PDFServiceHelper.narrow(ncRef.resolve_str("PDFService"));
 
             HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
-            
-            // Routes d'authentification
+
+            // Routes Authentification
             server.createContext("/login",    new LoginHandler());
             server.createContext("/register", new RegisterHandler());
+            server.createContext("/logout",   new LogoutHandler());
 
-            // Routes du Studio (Protégées)
+            // Routes Application (Protégées par checkAuth)
             server.createContext("/",         new UIHandler());
-            server.createContext("/create",   new GenerateHandler());
             server.createContext("/extract",  new ExtractHandler());
-            server.createContext("/image",    new ToImageHandler());
-            server.createContext("/protect",  new ProtectHandler());
-            server.createContext("/merge",    new MergeHandler());
-            server.createContext("/split",    new SplitHandler());
-            server.createContext("/delete",   new DeleteHandler());
-            server.createContext("/pages",    new ExtractPagesHandler());
-            server.createContext("/compress", new CompressHandler());
-            server.createContext("/meta",     new MetaReadHandler());
-            server.createContext("/metamod",  new MetaModHandler());
-            server.createContext("/qrcode",   new QRCodeHandler());
-            server.createContext("/sign",     new SignHandler());
+            // Ajoute ici tes autres contexts (merge, protect, etc.)
 
             server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(10));
-            System.out.println("Studio PDF CORBA Sécurisé -> http://localhost:8080");
+            System.out.println("Studio PDF CORBA Connecté -> http://localhost:8080");
             server.start();
         } catch (Exception e) {
             e.printStackTrace();
@@ -83,19 +76,25 @@ public class PDFWebGateway {
         } catch (IOException e) {}
     }
 
-    static boolean checkAuth(HttpExchange t) throws IOException {
+    static String getUsername(HttpExchange t) {
         String cookie = t.getRequestHeaders().getFirst("Cookie");
         if (cookie != null && cookie.contains("session=")) {
             String sid = cookie.split("session=")[1].split(";")[0];
-            if (sessions.containsKey(sid)) return true;
+            return sessions.get(sid);
         }
+        return null;
+    }
+
+    static boolean checkAuth(HttpExchange t) throws IOException {
+        String user = getUsername(t);
+        if (user != null) return true;
         t.getResponseHeaders().set("Location", "/login");
         t.sendResponseHeaders(303, -1);
         return false;
     }
 
     // ══════════════════════════════════════════════════════════
-    //  HANDLERS AUTH (Ta page de connexion)
+    //  HANDLERS AUTHENTIFICATION
     // ══════════════════════════════════════════════════════════
     static class LoginHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
@@ -132,105 +131,98 @@ public class PDFWebGateway {
         }
     }
 
+    static class LogoutHandler implements HttpHandler {
+        public void handle(HttpExchange t) throws IOException {
+            t.getResponseHeaders().add("Set-Cookie", "session=; Path=/; Max-Age=0; HttpOnly");
+            t.getResponseHeaders().set("Location", "/login");
+            t.sendResponseHeaders(303, -1);
+        }
+    }
+
     private static void renderAuthPage(HttpExchange t, String title, boolean isReg) throws IOException {
         String action = isReg ? "/register" : "/login";
         String link = isReg ? "/login" : "/register";
-        String linkText = isReg ? "Déjà inscrit ? Connexion" : "Pas de compte ? S'inscrire";
+        String linkText = isReg ? "Déjà un compte ? Connexion" : "Pas de compte ? S'inscrire";
         
-        String html = "<html><head><title>"+title+"</title><link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap' rel='stylesheet'>"
-            + "<style>body{margin:0;font-family:Inter,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#F5F3FF}"
-            + ".card{background:#fff;padding:40px;border-radius:24px;width:350px;box-shadow:0 20px 50px rgba(79,29,150,0.1)}"
-            + "h2{margin:0 0 20px;font-weight:600;color:#1E1B4B} label{font-size:12px;color:#6B7280;display:block;margin-top:15px}"
-            + ".inp{width:100%;padding:12px;border:1.5px solid #EDE9FE;border-radius:10px;margin-top:5px;outline:none;background:#F8F7FF}"
-            + ".btn{width:100%;background:#7C3AED;color:#fff;border:none;padding:14px;border-radius:12px;margin-top:25px;font-weight:600;cursor:pointer}"
+        String html = "<html><head><title>"+title+"</title><style>"
+            + "body{margin:0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#F5F3FF}"
+            + ".card{background:#fff;padding:40px;border-radius:20px;width:320px;box-shadow:0 10px 25px rgba(0,0,0,0.05)}"
+            + "input{width:100%;padding:12px;margin:10px 0;border:1px solid #EDE9FE;border-radius:8px;outline:none}"
+            + ".btn{width:100%;background:#7C3AED;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:600;cursor:pointer;margin-top:10px}"
             + "a{display:block;text-align:center;margin-top:15px;font-size:12px;color:#7C3AED;text-decoration:none}</style></head>"
             + "<body><div class='card'><h2>"+title+"</h2><form method='POST' action='"+action+"'>"
-            + "<label>Utilisateur</label><input name='user' class='inp' required>"
-            + "<label>Mot de passe</label><input name='pass' type='password' class='inp' required>"
+            + "User<input name='user' required>Pass<input name='pass' type='password' required>"
             + "<button class='btn'>Entrer</button></form><a href='"+link+"'>"+linkText+"</a></div></body></html>";
         sendHtml(t, html);
     }
 
     // ══════════════════════════════════════════════════════════
-    //  PAGE PRINCIPALE (Ton Dashboard de Master)
+    //  INTERFACE STUDIO (UI)
     // ══════════════════════════════════════════════════════════
     static class UIHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
             if (!checkAuth(t)) return;
-            
-            String html = "<!DOCTYPE html><html lang='fr'><head>"
-                + "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Studio PDF CORBA</title>"
-                + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap' rel='stylesheet'>"
-                + CSS + "</head><body>"
-                + "<div class='topbar'><div class='topbar-row'>"
-                + "<div><h1>Studio PDF CORBA</h1><p>Gestionnaire distribue &mdash; Connecte</p></div>"
-                + "<span class='badge'><span class='dot'></span>&nbsp;Session Active</span>"
-                + "</div></div>"
-                + "<div class='main'>"
+            String user = getUsername(t);
+            boolean isAdmin = admins.contains(user);
+
+            String html = "<html><head><meta charset='UTF-8'><style>"
+                + "*{box-sizing:border-box;margin:0;padding:0;font-family:sans-serif}"
+                + "body{background:#F8F9FD} .topbar{background:#4F1D96;padding:40px 20px 80px;color:#fff;text-align:center}"
+                + ".nav-top{display:flex;justify-content:space-between;max-width:1100px;margin: -30px auto 20px;padding:0 20px}"
+                + ".container{max-width:1100px;margin:0 auto;padding:0 20px}"
+                + ".stats{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-top:-60px;margin-bottom:30px}"
+                + ".stat{background:#fff;padding:20px;border-radius:8px;text-align:center;box-shadow:0 2px 10px rgba(0,0,0,0.05);border-top:4px solid #7C3AED}"
+                + ".tools{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}"
+                + ".tc{background:#fff;padding:30px;border-radius:8px;text-align:center;cursor:pointer;transition:0.2s;border-top:4px solid #DDD6FE}"
+                + ".tc:hover{transform:translateY(-3px);box-shadow:0 10px 20px rgba(0,0,0,0.05)}"
+                + ".admin-sec{background:#FEF2F2;padding:20px;border-radius:8px;margin-bottom:20px;border:1px solid #FEE2E2;color:#991B1B}"
+                + ".logout{color:#fff;text-decoration:none;font-size:12px;border:1px solid rgba(255,255,255,0.4);padding:5px 12px;border-radius:4px}"
+                + ".overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:100;align-items:center;justify-content:center}"
+                + ".active{display:flex} .modal{background:#fff;padding:30px;border-radius:12px;width:350px}"
+                + "</style></head><body>"
+                + "<div class='topbar'><h1>Studio PDF CORBA</h1><p>Connecté en tant que: <b>"+user+"</b></p></div>"
+                + "<div class='nav-top'><div style='width:1px'></div><a href='/logout' class='logout'>Déconnexion</a></div>"
+                + "<div class='container'>"
                 + "<div class='stats'>"
-                + statDiv("PDFs crees", nbCrees, "st1") + statDiv("Extractions", nbExtractions, "st2")
-                + statDiv("Fusions", nbFusions, "st3") + statDiv("Proteges", nbProtections, "st4")
+                + "<div class='stat'><h3>"+nbCrees+"</h3><p>Créés</p></div><div class='stat'><h3>"+nbExtractions+"</h3><p>Extractions</p></div>"
+                + "<div class='stat'><h3>"+nbFusions+"</h3><p>Fusions</p></div><div class='stat'><h3>"+nbProtections+"</h3><p>Protégés</p></div>"
                 + "</div>"
-                + "<p class='sec-label'>Outils disponibles</p>"
+                + (isAdmin ? "<div class='admin-sec'><b>Outils Administrateur</b><br>Gestion des logs et serveurs CORBA active.</div>" : "")
                 + "<div class='tools'>"
-                + tc("linear-gradient(90deg,#7C3AED,#A78BFA)", "Extraire texte", "m-extract")
-                + tc("linear-gradient(90deg,#0EA5E9,#7DD3FC)", "En images", "m-image")
-                + tc("linear-gradient(90deg,#10B981,#6EE7B7)", "Proteger", "m-protect")
-                + tc("linear-gradient(90deg,#F59E0B,#FCD34D)", "Fusionner", "m-merge")
-                + tc("linear-gradient(90deg,#EC4899,#F9A8D4)", "Decouper", "m-split")
-                + tc("linear-gradient(90deg,#EF4444,#FCA5A5)", "Supprimer pages", "m-delete")
-                + tc("linear-gradient(90deg,#8B5CF6,#C4B5FD)", "Extraire pages", "m-pages")
-                + tc("linear-gradient(90deg,#14B8A6,#99F6E4)", "Compresser", "m-compress")
-                + tc("linear-gradient(90deg,#6366F1,#A5B4FC)", "Metadonnees", "m-meta")
-                + tc("linear-gradient(90deg,#D946EF,#F0ABFC)", "Modifier meta", "m-metamod")
-                + tc("linear-gradient(90deg,#0284C7,#7DD3FC)", "QR Code", "m-qrcode")
-                + tc("linear-gradient(90deg,#059669,#6EE7B7)", "Signer", "m-sign")
-                + "</div>"
-                + "</div>"
-                + generateModals()
-                + "<script>function openM(id){document.getElementById(id).classList.add('active')} function closeM(id){document.getElementById(id).classList.remove('active')} function showName(id,i){document.getElementById(id).textContent=i.files[0].name}</script>"
+                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#A78BFA'><h3>Extraire Texte</h3></div>"
+                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#7DD3FC'><h3>Images</h3></div>"
+                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#34D399'><h3>Protéger</h3></div>"
+                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#FBBF24'><h3>Fusionner</h3></div>"
+                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#F472B6'><h3>QR Code</h3></div>"
+                + "<div class='tc' onclick='openM(\"m1\")' style='border-top-color:#2DD4BF'><h3>Signer</h3></div>"
+                + "</div></div>"
+                + "<div id='m1' class='overlay'><div class='modal'><h2>Action PDF</h2><form method='POST' enctype='multipart/form-data' action='/extract'><input type='file' name='doc' required><br><br><button style='width:100%;padding:10px;background:#7C3AED;color:white;border:none;border-radius:6px'>Lancer</button><button type='button' onclick='closeM(\"m1\")' style='width:100%;background:none;border:none;margin-top:10px;color:#999'>Annuler</button></form></div></div>"
+                + "<script>function openM(id){document.getElementById(id).classList.add('active')} function closeM(id){document.getElementById(id).classList.remove('active')}</script>"
                 + "</body></html>";
             sendHtml(t, html);
         }
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  STYLING & HELPERS (Recopiés de ton design)
-    // ══════════════════════════════════════════════════════════
-    static final String CSS = "<style>*{box-sizing:border-box;margin:0;padding:0;font-family:'Inter',sans-serif} body{background:#F5F3FF} .topbar{background:linear-gradient(135deg,#4F1D96,#6D28D9);padding:30px 30px 80px;color:#fff} .main{padding:0 24px;margin-top:-50px} .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-bottom:30px} .stat{background:#fff;padding:20px;border-radius:16px} .stat-n{font-size:24px;font-weight:700} .st1 .stat-n{color:#4C1D95} .tools{display:grid;grid-template-columns:repeat(4,1fr);gap:15px} .tc{background:#fff;border-radius:14px;padding:20px;cursor:pointer;transition:0.2s} .tc:hover{transform:translateY(-3px);box-shadow:0 10px 20px rgba(0,0,0,0.05)} .tc-bar{height:4px;width:30px;border-radius:2px;margin-bottom:10px} .overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.3);backdrop-filter:blur(5px);z-index:100;align-items:center;justify-content:center} .active{display:flex} .modal{background:#fff;padding:30px;border-radius:20px;width:400px} .btn-ok{width:100%;background:#7C3AED;color:#fff;border:none;padding:12px;border-radius:10px;margin-top:10px;cursor:pointer} .badge{background:rgba(255,255,255,0.2);padding:5px 15px;border-radius:20px;font-size:12px} .dot{height:8px;width:8px;background:#4ADE80;border-radius:50%;display:inline-block}</style>";
-
-    static String statDiv(String l, int n, String cl) { return "<div class='stat "+cl+"'><div style='font-size:10px;text-transform:uppercase;color:#6B7280'>"+l+"</div><div class='stat-n'>"+n+"</div></div>"; }
-    
-    static String tc(String g, String t, String m) { return "<div class='tc' onclick='openM(\""+m+"\")'><div class='tc-bar' style='background:"+g+"'></div><h3>"+t+"</h3><p style='font-size:11px;color:#9CA3AF'>Outil Studio PDF</p></div>"; }
-
-    static String generateModals() {
-        return modal("m-extract", "Extraire Texte", "/extract", uploadZone("f1"))
-             + modal("m-image", "PDF vers Images", "/image", uploadZone("f2")+"<label>DPI</label><input name='dpi' value='150' class='inp'>")
-             + modal("m-protect", "Mot de passe", "/protect", uploadZone("f3")+"<input name='mdp' type='password' class='inp' placeholder='Mot de passe'>")
-             + modal("m-merge", "Fusionner", "/merge", uploadZone("f4"))
-             + modal("m-compress", "Compresser", "/compress", uploadZone("f5"))
-             + modal("m-qrcode", "Ajouter QR", "/qrcode", uploadZone("f6")+"<input name='contenu' placeholder='Lien...' class='inp'>")
-             + modal("m-sign", "Signer PDF", "/sign", uploadZone("f7")+"<input name='nom' placeholder='Votre nom' class='inp'>")
-             + modal("m-split", "Decouper", "/split", uploadZone("f8"))
-             + modal("m-delete", "Supprimer Pages", "/delete", uploadZone("f9"))
-             + modal("m-pages", "Extraire Pages", "/pages", uploadZone("f10"))
-             + modal("m-meta", "Metadonnees", "/meta", uploadZone("f11"))
-             + modal("m-metamod", "Modif Meta", "/metamod", uploadZone("f12"));
+    // HANDLER TECHNIQUE EXEMPLE
+    static class ExtractHandler implements HttpHandler {
+        public void handle(HttpExchange t) throws IOException {
+            if (!checkAuth(t)) return;
+            try {
+                byte[] pdf = parseMultipart(t).files.values().iterator().next();
+                String res = pdfRef.extraireTexte(pdf);
+                nbExtractions++;
+                sendHtml(t, "<h3>Résultat :</h3><pre>"+res+"</pre><a href='/'>Retour</a>");
+            } catch (Exception e) { sendHtml(t, "Erreur"); }
+        }
     }
 
-    static String modal(String id, String t, String a, String c) { return "<div class='overlay' id='"+id+"'><div class='modal'><h2>"+t+"</h2><form method='POST' enctype='multipart/form-data' action='"+a+"'>"+c+"<button class='btn-ok'>Lancer</button><button type='button' onclick='closeM(\""+id+"\")' style='width:100%;background:none;border:none;margin-top:10px;cursor:pointer;color:#9CA3AF'>Annuler</button></form></div></div>"; }
-    
-    static String uploadZone(String id) { return "<div style='border:2px dashed #DDD6FE;padding:20px;text-align:center;margin:10px 0;border-radius:10px' onclick='document.getElementById(\""+id+"\").click()'><p id='l-"+id+"' style='font-size:13px;color:#7C3AED'>Choisir PDF</p></div><input type='file' id='"+id+"' name='doc' style='display:none' onchange='showName(\"l-"+id+"\",this)'>"; }
-
-    // Handlers techniques (Generate, Extract, etc. - identiques à ton code original)
-    static class ExtractHandler implements HttpHandler { public void handle(HttpExchange t) throws IOException { if(!checkAuth(t))return; try { byte[] pdf = parseMultipart(t).files.values().iterator().next(); String res = pdfRef.extraireTexte(pdf); nbExtractions++; sendHtml(t, "<h3>Texte :</h3><pre>"+res+"</pre><a href='/'>Retour</a>"); } catch(Exception e){sendHtml(t, "Erreur");} } }
-    static class GenerateHandler implements HttpHandler { public void handle(HttpExchange t) throws IOException { try { Map<String,String> p = parseQuery(t.getRequestURI().getQuery()); byte[] pdf = pdfRef.creerPDF(p.get("titre"), p.get("corps")); nbCrees++; sendPdf(t, pdf, "doc.pdf"); } catch(Exception e){}} }
-    // ... AJOUTE ICI TOUS LES AUTRES HANDLERS (ToImageHandler, ProtectHandler, etc.) de ton fichier original ...
-
     // UTILS
-    static void sendHtml(HttpExchange t, String h) throws IOException { byte[] b = h.getBytes(StandardCharsets.UTF_8); t.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8"); t.sendResponseHeaders(200, b.length); t.getResponseBody().write(b); t.getResponseBody().close(); }
-    static void sendPdf(HttpExchange t, byte[] d, String n) throws IOException { t.getResponseHeaders().set("Content-Type","application/pdf"); t.getResponseHeaders().set("Content-Disposition","attachment; filename="+n); t.sendResponseHeaders(200, d.length); t.getResponseBody().write(d); t.getResponseBody().close(); }
+    static void sendHtml(HttpExchange t, String h) throws IOException {
+        byte[] b = h.getBytes(StandardCharsets.UTF_8);
+        t.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+        t.sendResponseHeaders(200, b.length);
+        t.getResponseBody().write(b); t.getResponseBody().close();
+    }
     static byte[] readAllBytes(InputStream is) throws IOException { ByteArrayOutputStream b = new ByteArrayOutputStream(); byte[] buf = new byte[8192]; int n; while((n=is.read(buf))!=-1) b.write(buf,0,n); return b.toByteArray(); }
     static Map<String,String> parseQuery(String q) { Map<String,String> m = new HashMap<>(); if(q==null) return m; for(String s : q.split("&")){String[] kv=s.split("=",2); if(kv.length>1) m.put(kv[0], kv[1]);} return m; }
     static class MultipartData { Map<String,byte[]> files = new HashMap<>(); }

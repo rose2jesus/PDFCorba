@@ -6,15 +6,14 @@ COPY src/ ./src/
 COPY lib/ ./lib/
 RUN mkdir -p bin
 
-# 1. Compilation : Utilisation du wildcard pour inclure tous les JARs du dossier lib
+# Compilation (utilisation du séparateur ':' pour Linux)
 RUN javac -d bin -cp "lib/*:." src/PDFApp/*.java src/PDFServer/*.java
 
-# 2. Exposition du port 8080 (celui utilisé par votre PDFWebGateway)
+# Exposition du port par défaut de Render
 EXPOSE 8080
 
-# 3. Lancement des services
-# On lance orbd et le serveur en arrière-plan (&)
-# On finit par la Gateway SANS le '&' pour que Render ne ferme pas le conteneur
+# Commande de lancement robuste
+# On utilise 'wait' pour s'assurer que le conteneur reste actif tant que la Gateway tourne
 CMD sh -c "orbd -ORBInitialPort 1050 & sleep 5 && \
     java -cp bin:lib/* PDFServer.StartServer -ORBInitialPort 1050 & sleep 5 && \
     java -cp bin:lib/* PDFServer.PDFWebGateway"

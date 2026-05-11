@@ -6,14 +6,15 @@ COPY src/ ./src/
 COPY lib/ ./lib/
 RUN mkdir -p bin
 
-# Compilation (utilisation du séparateur ':' pour Linux)
+# Compilation avec le bon séparateur Linux ':'
 RUN javac -d bin -cp "lib/*:." src/PDFApp/*.java src/PDFServer/*.java
 
-# Exposition du port par défaut de Render
+# Render détecte ce port pour le trafic Web
 EXPOSE 8080
 
-# Commande de lancement robuste
-# On utilise 'wait' pour s'assurer que le conteneur reste actif tant que la Gateway tourne
-CMD sh -c "orbd -ORBInitialPort 1050 & sleep 15 && \
-    java -cp bin:lib/* PDFServer.StartServer -ORBInitialPort 1050 & sleep 5 && \
+# Utilisation de l'adresse 127.0.0.1 pour forcer la communication interne
+CMD sh -c "orbd -ORBInitialPort 1050 -ORBInitialHost 127.0.0.1 & \
+    sleep 10 && \
+    java -cp bin:lib/* PDFServer.StartServer -ORBInitialPort 1050 -ORBInitialHost 127.0.0.1 & \
+    sleep 10 && \
     java -cp bin:lib/* PDFServer.PDFWebGateway"

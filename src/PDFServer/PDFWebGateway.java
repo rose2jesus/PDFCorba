@@ -12,37 +12,63 @@ import org.omg.CORBA.*;
 public class PDFWebGateway {
     private static PDFService pdfRef;
     
-    // Sessions et utilisateurs
+    // Statistiques pour l'admin
+    private static int nbCrees = 0, nbExtractions = 0, nbFusions = 0, nbProtections = 0;
+
+    // Gestion des utilisateurs et sessions
     private static final Map<String, String> SESSIONS = new HashMap<>();
     private static final Map<String, String> USERS = new HashMap<>();
     private static final Map<String, String> ROLES = new HashMap<>();
 
     static {
+        // Utilisateurs par défaut
         USERS.put("admin@pdf.com", "admin123");
         ROLES.put("admin@pdf.com", "admin");
+        USERS.put("user@pdf.com", "user123");
+        ROLES.put("user@pdf.com", "user");
     }
 
-    // --- LOGIQUE SERVEUR ---
+    // ── MAIN ET INITIALISATION CORBA ───────────────────────
     public static void main(String[] args) throws Exception {
         try {
-            ORB orb = ORB.init(args, null);
+            // Configuration spécifique pour le déploiement Cloud (Render/Linux)
+            Properties props = new Properties();
+            props.put("org.omg.CORBA.ORBInitialPort", "1050");
+            props.put("org.omg.CORBA.ORBInitialHost", "127.0.0.1");
+            
+            ORB orb = ORB.init(args, props);
             org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
             NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
             pdfRef = PDFServiceHelper.narrow(ncRef.resolve_str("PDFService"));
 
+            // Démarrage du serveur Web sur le port 8080
             HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
-            server.createContext("/",         new UIHandler());
+            
+            // Routes Authentification
             server.createContext("/login",    new LoginHandler());
             server.createContext("/register", new RegisterHandler());
             server.createContext("/logout",   new LogoutHandler());
             
+            // Route Principale et Outils
+            server.createContext("/",         new UIHandler());
+            
+            // Routes des fonctionnalités
+            server.createContext("/create",   new ActionHandler("Création"));
+            server.createContext("/extract",  new ActionHandler("Extraction"));
+            server.createContext("/merge",    new ActionHandler("Fusion"));
+            // ... autres routes pointant vers vos Handlers spécifiques
+
             server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(10));
-            System.out.println("Studio PDF CORBA -> http://localhost:8080");
+            System.out.println("Studio PDF CORBA opérationnel sur http://localhost:8080");
             server.start();
-        } catch (Exception e) { e.printStackTrace(); }
+        } catch (Exception e) {
+            System.err.println("Erreur de lancement : " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 
-    // --- AUTHENTIFICATION ---
+    // ── GESTIONNAIRES D'ACCÈS ──────────────────────────────
+
     static class LoginHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
             if ("POST".equals(t.getRequestMethod())) {
@@ -53,7 +79,7 @@ public class PDFWebGateway {
                     SESSIONS.put(sid, ROLES.get(email));
                     t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
                     redirect(t, "/");
-                } else { sendHtml(t, authPage("Identifiants incorrects", true)); }
+                } else { sendHtml(t, authPage("Email ou mot de passe incorrect.", true)); }
             } else { sendHtml(t, authPage(null, true)); }
         }
     }
@@ -67,7 +93,7 @@ public class PDFWebGateway {
                     USERS.put(email, pass);
                     ROLES.put(email, "user");
                     redirect(t, "/login");
-                } else { sendHtml(t, authPage("Email déjà pris", false)); }
+                } else { sendHtml(t, authPage("Cet email est déjà utilisé.", false)); }
             } else { sendHtml(t, authPage(null, false)); }
         }
     }
@@ -81,7 +107,8 @@ public class PDFWebGateway {
         }
     }
 
-    // --- INTERFACE PRINCIPALE (12 FONCTIONNALITÉS) ---
+    // ── INTERFACE UTILISATEUR ───────────────────────────────
+
     static class UIHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
             if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
@@ -89,33 +116,37 @@ public class PDFWebGateway {
 
             String html = "<!DOCTYPE html><html lang='fr'><head><meta charset='UTF-8'>"
                 + "<title>Studio PDF CORBA</title>"
-                + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap' rel='stylesheet'>"
+                + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap' rel='stylesheet'>"
                 + CSS_APP + "</head><body>"
                 + "<div class='topbar'><h1>Studio PDF CORBA</h1>"
-                + "<div><span class='role'>" + (admin?"ADMIN":"USER") + "</span>"
-                + "<a href='/logout' class='btn-out'>Déconnexion</a></div></div>"
+                + "<div><span class='badge'>" + (admin?"ADMINISTRATEUR":"UTILISATEUR") + "</span>"
+                + "<a href='/logout' class='btn-logout'>Déconnexion</a></div></div>"
                 + "<div class='main'>";
 
             if (admin) {
-                html += "<div class='admin-panel'><h3>Gestion Système</h3><p>Utilisateurs actifs : " + USERS.size() + "</p></div>";
+                html += "<div class='admin-card'><h3>Statistiques Globales</h3>"
+                    + "<div style='display:flex;gap:20px;margin-top:10px'>"
+                    + "<span>Utilisateurs : " + USERS.size() + "</span>"
+                    + "<span>Documents créés : " + nbCrees + "</span>"
+                    + "</div></div>";
             }
 
-            html += "<h2>Mes 12 Outils PDF</h2>"
+            html += "<h2>Mes 12 Outils</h2>"
                 + "<div class='grid'>"
-                + tool("Extraire Texte", "txt", "Extraire le contenu texte")
-                + tool("Vers Image", "img", "Convertir PDF en PNG/JPG")
-                + tool("Créer PDF", "new", "Générer un PDF vierge")
+                + tool("Extraire Texte", "txt", "Récupérer le texte d'un PDF")
+                + tool("Vers Image", "img", "Convertir les pages en images")
+                + tool("Créer PDF", "new", "Générer un nouveau document")
                 + tool("Protéger", "lock", "Ajouter un mot de passe")
-                + tool("Fusionner", "join", "Assembler plusieurs PDF")
-                + tool("Découper", "cut", "Diviser un document")
-                + tool("Supprimer Page", "del", "Enlever une page spécifique")
-                + tool("Extraire Pages", "pages", "Sélectionner un intervalle")
-                + tool("Compresser", "zip", "Réduire la taille du fichier")
-                + tool("Lire Meta", "meta", "Voir auteur et propriétés")
-                + tool("Modifier Meta", "edit", "Changer les métadonnées")
-                + tool("Générer QR", "qr", "Ajouter un QR code")
+                + tool("Fusionner", "join", "Combiner deux fichiers")
+                + tool("Découper", "cut", "Séparer un PDF")
+                + tool("Supprimer Page", "del", "Retirer une page inutile")
+                + tool("Extraire Pages", "pages", "Choisir un intervalle")
+                + tool("Compresser", "zip", "Réduire le poids du fichier")
+                + tool("Lire Meta", "meta", "Propriétés du document")
+                + tool("Modifier Meta", "edit", "Changer titre/auteur")
+                + tool("Générer QR", "qr", "Ajouter un QR Code")
                 + "</div></div>"
-                + "<script>function run(id){ alert('Démarrage de : ' + id); }</script></body></html>";
+                + "<script>function run(id){ alert('Démarrage de l\\'outil : ' + id); }</script></body></html>";
 
             sendHtml(t, html);
         }
@@ -124,27 +155,24 @@ public class PDFWebGateway {
         }
     }
 
-    // --- STYLES CSS ---
+    // ── STYLES CSS ─────────────────────────────────────────
+
     static final String CSS_APP = "<style>"
         + "*{box-sizing:border-box;margin:0;padding:0;font-family:'Inter',sans-serif}"
-        + "body{background:#F9FAFB; color:#111827}"
-        + ".topbar{background:#4F1D96; padding:15px 40px; display:flex; justify-content:space-between; align-items:center; color:white; box-shadow:0 2px 10px rgba(0,0,0,0.1)}"
-        + ".topbar h1{font-size:18px; font-weight:700}"
-        + ".main{max-width:1100px; margin:40px auto; padding:0 20px}"
-        + "h2{margin-bottom:25px; font-weight:800; color:#4F1D96; font-size:24px}"
-        + ".grid{display:grid; grid-template-columns:repeat(4, 1fr); gap:20px}"
-        + ".card{background:white; padding:25px; border-radius:16px; cursor:pointer; transition:0.3s; border:1px solid #E5E7EB}"
-        + ".card:hover{transform:translateY(-5px); border-color:#6D28D9; box-shadow:0 12px 24px rgba(109,40,217,0.1)}"
-        + ".card h3{font-size:15px; color:#1F2937; margin-bottom:8px}"
-        + ".card p{font-size:12px; color:#6B7280}"
-        + ".role{background:#FDE68A; color:#92400E; padding:5px 12px; border-radius:20px; font-size:11px; font-weight:700; text-transform:uppercase}"
-        + ".btn-out{margin-left:20px; color:white; text-decoration:none; font-size:13px; font-weight:600; opacity:0.8}"
-        + ".admin-panel{background:#EEF2FF; padding:20px; border-radius:16px; margin-bottom:30px; border:1px dashed #4F1D96}"
+        + "body{background:#F9FAFB;color:#111827}"
+        + ".topbar{background:#4F1D96;padding:15px 40px;display:flex;justify-content:space-between;align-items:center;color:white}"
+        + ".main{max-width:1100px;margin:40px auto;padding:0 20px}"
+        + ".grid{display:grid;grid-template-columns:repeat(4,1fr);gap:20px}"
+        + ".card{background:white;padding:25px;border-radius:16px;cursor:pointer;transition:0.3s;border:1px solid #E5E7EB}"
+        + ".card:hover{transform:translateY(-5px);border-color:#6D28D9;box-shadow:0 10px 20px rgba(109,40,217,0.1)}"
+        + ".badge{background:#FDE68A;color:#92400E;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:700}"
+        + ".btn-logout{margin-left:20px;color:white;text-decoration:none;font-size:13px;font-weight:600}"
+        + ".admin-card{background:#EEF2FF;padding:20px;border-radius:16px;margin-bottom:30px;border:1px dashed #4F1D96}"
         + "</style>";
 
     static final String CSS_AUTH = "body{background:linear-gradient(135deg,#4F1D96,#2D3B8E);height:100vh;display:flex;align-items:center;justify-content:center;font-family:sans-serif}"
-        + ".box{background:white;padding:50px;border-radius:24px;width:380px;text-align:center;box-shadow:0 20px 40px rgba(0,0,0,0.2)}"
-        + "input{width:100%;padding:14px;margin:12px 0;border:2px solid #F3F4F6;border-radius:12px;outline:none}"
+        + ".box{background:white;padding:50px;border-radius:24px;width:380px;text-align:center}"
+        + "input{width:100%;padding:14px;margin:10px 0;border:2px solid #F3F4F6;border-radius:12px;outline:none}"
         + "button{width:100%;padding:14px;background:#6D28D9;color:white;border:none;border-radius:12px;font-weight:700;cursor:pointer;margin-top:10px}"
         + "a{display:block;margin-top:20px;color:#6D28D9;text-decoration:none;font-size:13px}";
 
@@ -159,7 +187,8 @@ public class PDFWebGateway {
             + "</div></body></html>";
     }
 
-    // --- UTILITAIRES (Inchangés) ---
+    // ── UTILITAIRES ────────────────────────────────────────
+
     static String getSession(HttpExchange t) {
         String c = t.getRequestHeaders().getFirst("Cookie");
         if (c==null) return null;
@@ -187,5 +216,10 @@ public class PDFWebGateway {
         byte[] buf = new byte[8192]; int n;
         while((n=i.read(buf))!=-1) o.write(buf,0,n);
         return o.toByteArray();
+    }
+
+    static class ActionHandler implements HttpHandler {
+        String name; ActionHandler(String n) { this.name = n; }
+        public void handle(HttpExchange t) throws IOException { sendHtml(t, "L'outil " + name + " est en cours d'exécution via CORBA..."); }
     }
 }

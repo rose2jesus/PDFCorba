@@ -190,7 +190,7 @@ public class PDFWebGateway {
                 sendHtml(t, html);
             } else if ("POST".equalsIgnoreCase(method)) {
                 byte[] body = readAllBytes(t.getRequestBody());
-                Map<String,String> params = parseFormBody(new String(body, "UTF-8"));
+                Map<String,String> params; try { params = parseFormBody(new String(body, "UTF-8")); } catch (Exception ex) { redirect(t, "/login?error=1"); return; }
                 String username = params.getOrDefault("username", "");
                 String password = params.getOrDefault("password", "");
 

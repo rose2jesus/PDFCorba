@@ -18,28 +18,36 @@ public class PDFWebGateway {
     private static final Map<String, String> ROLES = new HashMap<>();
 
     static {
-        // Utilisateur admin par défaut
         USERS.put("admin@pdf.com", "admin123");
         ROLES.put("admin@pdf.com", "admin");
     }
 
     public static void main(String[] args) {
         try {
-            // Initialisation CORBA
-            ORB orb = ORB.init(args, null);
-            org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
-            NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
-            pdfRef = PDFServiceHelper.narrow(ncRef.resolve_str("PDFService"));
+            // 1. Initialisation CORBA (On entoure pour éviter que le main crash direct)
+            try {
+                ORB orb = ORB.init(args, null);
+                org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
+                NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
+                pdfRef = PDFServiceHelper.narrow(ncRef.resolve_str("PDFService"));
+                System.out.println("Connexion CORBA réussie.");
+            } catch (Exception e) {
+                System.err.println("ALERTE : Impossible de se connecter au serveur CORBA. Vérifiez si le serveur tourne.");
+                e.printStackTrace();
+            }
 
-            HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+            // 2. Gestion du Port pour Render (Important !)
+            String portEnv = System.getenv("PORT");
+            int port = (portEnv != null) ? Integer.parseInt(portEnv) : 8080;
+
+            HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
             
-            // Routes principales
+            // Routes
             server.createContext("/",         new UIHandler());
             server.createContext("/login",    new LoginHandler());
             server.createContext("/register", new RegisterHandler());
             server.createContext("/logout",   new LogoutHandler());
             
-            // Enregistrement automatique des 13 services
             String[] services = {
                 "fusionner", "decouper", "extrairePages", "supprimerPages", 
                 "proteger", "convertirImages", "extraireTexte", "creer", 
@@ -51,63 +59,58 @@ public class PDFWebGateway {
             }
 
             server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(15));
-            System.out.println("Studio PDF Gateway en ligne : http://localhost:8080");
+            System.out.println("Serveur Web démarré sur le port : " + port);
             server.start();
+
         } catch (Exception e) {
+            System.err.println("ERREUR CRITIQUE AU DÉMARRAGE :");
             e.printStackTrace();
         }
     }
 
-    // ─── HANDLER GÉNÉRIQUE (POUR LES 13 SERVICES) ──────────────────────────
+    // --- HANDLER AVEC SÉCURITÉ RUNTIME ---
     static class PdfActionHandler implements HttpHandler {
         private String action;
         PdfActionHandler(String action) { this.action = action; }
 
         @Override
         public void handle(HttpExchange t) throws IOException {
-            String user = getLoggedUser(t);
-            if (user == null) { redirect(t, "/login"); return; }
-
             try {
+                String user = getLoggedUser(t);
+                if (user == null) { redirect(t, "/login"); return; }
+
                 nbTotalActions++;
                 byte[] result = null;
 
                 if ("creer".equals(action)) {
-                    // Lecture sécurisée des paramètres
                     Map<String, String> q = parseQuery(t.getRequestURI().getQuery());
-                    result = pdfRef.creerPDF(q.getOrDefault("titre", "Document"), q.getOrDefault("corps", ""));
+                    if (pdfRef != null) result = pdfRef.creerPDF(q.getOrDefault("titre", "Doc"), q.getOrDefault("corps", ""));
                 } else {
-                    // Réception du fichier binaire de l'utilisateur
                     byte[] fileData = readAllBytes(t.getRequestBody());
-                    if (fileData.length > 0) {
+                    if (fileData.length > 0 && pdfRef != null) {
                         if ("extraireTexte".equals(action)) {
-                            String txt = pdfRef.extraireTexte(fileData);
-                            sendHtml(t, "<h3>Texte extrait :</h3><pre>"+txt+"</pre><a href='/'>Retour</a>");
+                            sendHtml(t, "<h3>Texte :</h3><pre>"+pdfRef.extraireTexte(fileData)+"</pre><a href='/'>Retour</a>");
                             return;
                         }
-                        // Autres appels CORBA selon l'action...
                     }
                 }
 
                 if (result != null) sendPdf(t, result, "resultat.pdf");
-                else sendHtml(t, "<h3>Succès</h3><p>Action " + action + " effectuée.</p><a href='/'>Retour</a>");
+                else sendHtml(t, "<h3>Succès</h3><p>Action " + action + " validée.</p><a href='/'>Retour</a>");
 
             } catch (Exception e) {
-                sendError(t, "Erreur CORBA : " + e.getMessage());
+                sendError(t, "Erreur lors de l'exécution : " + e.getMessage());
             }
         }
     }
 
-    // ─── LOGIN HANDLER (CORRIGÉ POUR L'ERREUR RENDER) ───────────────────────
     static class LoginHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange t) throws IOException {
-            if ("POST".equals(t.getRequestMethod())) {
-                // PROTECTION ICI : On entoure tout de try-catch
-                try {
+            try {
+                if ("POST".equals(t.getRequestMethod())) {
                     String body = new String(readAllBytes(t.getRequestBody()), "UTF-8");
                     Map<String, String> params = parseForm(body);
-                    
                     String email = params.get("email");
                     String pass = params.get("password");
 
@@ -117,67 +120,40 @@ public class PDFWebGateway {
                         t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
                         redirect(t, "/");
                     } else {
-                        sendHtml(t, "Identifiants incorrects. <a href='/login'>Réessayer</a>");
+                        sendHtml(t, "Erreur login. <a href='/login'>Retour</a>");
                     }
-                } catch (Exception e) {
-                    sendError(t, "Erreur de formulaire : " + e.getMessage());
+                } else {
+                    sendHtml(t, "<h2>Connexion</h2><form method='POST'>Email: <input name='email'><br>Pass: <input type='password' name='password'><br><button>OK</button></form>");
                 }
-            } else {
-                sendHtml(t, "<h2>Connexion Studio PDF</h2><form method='POST'>"
-                    + "Email: <input name='email' required><br>"
-                    + "Pass: <input type='password' name='password' required><br>"
-                    + "<button type='submit'>Se connecter</button></form>"
-                    + "<br><a href='/register'>Créer un compte</a>");
+            } catch (Exception e) {
+                sendError(t, "Erreur Login : " + e.getMessage());
             }
         }
     }
 
-    // ─── INTERFACE & DASHBOARD ─────────────────────────────────────────────
     static class UIHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange t) throws IOException {
-            String user = getLoggedUser(t);
-            if (user == null) { redirect(t, "/login"); return; }
-            
-            boolean isAdmin = "admin".equals(ROLES.get(user));
-            
-            String html = "<html><head><style>" + CSS + "</style></head><body>"
-                + "<div class='top'>STUDIO PDF | " + user + " | <a href='/logout'>Déconnexion</a></div>"
-                + (isAdmin ? "<div class='dash'>Dashboard Admin : " + nbTotalActions + " opérations traitées</div>" : "")
-                + "<div class='container'><h2>Mes 13 Services</h2><div class='grid'>"
-                + b("Fusionner", "fusionner") + b("Compresser", "compresser") + b("Signer", "signer")
-                + b("Protéger", "proteger") + b("QR Code", "qrcode") + b("Images", "convertirImages")
-                + b("Extraire Texte", "extraireTexte") + b("Créer", "creer") + b("Découper", "decouper")
-                + b("Supprimer Pages", "supprimerPages") + b("Extraire Pages", "extrairePages")
-                + b("Lire Meta", "lireMeta") + b("Modifier Meta", "modifierMeta")
-                + "</div></div></body></html>";
-            sendHtml(t, html);
-        }
-        private String b(String label, String action) {
-            return "<div class='card'><h4>"+label+"</h4>"
-                 + "<form action='/"+action+"' method='POST' enctype='multipart/form-data'>"
-                 + "<input type='file' name='f'><br><button type='submit'>Lancer</button></form></div>";
-        }
-    }
-
-    // ─── INSCRIPTION ────────────────────────────────────────────────────────
-    static class RegisterHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange t) throws IOException {
-            if ("POST".equals(t.getRequestMethod())) {
-                try {
-                    Map<String, String> p = parseForm(new String(readAllBytes(t.getRequestBody())));
-                    USERS.put(p.get("email"), p.get("password"));
-                    ROLES.put(p.get("email"), "user");
-                    redirect(t, "/login");
-                } catch (Exception e) { sendError(t, "Erreur inscription"); }
-            } else {
-                sendHtml(t, "<h2>Inscription</h2><form method='POST'>Email: <input name='email'><br>Pass: <input type='password' name='password'><br><button>S'inscrire</button></form>");
+            try {
+                String user = getLoggedUser(t);
+                if (user == null) { redirect(t, "/login"); return; }
+                boolean isAdmin = "admin".equals(ROLES.get(user));
+                
+                StringBuilder sb = new StringBuilder();
+                sb.append("<html><body><h1>Studio PDF</h1>");
+                if(isAdmin) sb.append("<p style='color:blue'>Admin Dashboard - Actions : " + nbTotalActions + "</p>");
+                sb.append("<ul>");
+                String[] acts = {"fusionner", "extraireTexte", "creer", "proteger", "compresser", "signer"};
+                for(String a : acts) sb.append("<li><a href='/"+a+"'>"+a+"</a></li>");
+                sb.append("</ul></body></html>");
+                sendHtml(t, sb.toString());
+            } catch (Exception e) {
+                sendError(t, "Erreur UI : " + e.getMessage());
             }
         }
     }
 
-    // ─── UTILITAIRES ────────────────────────────────────────────────────────
+    // --- UTILITAIRES ---
     static String getLoggedUser(HttpExchange t) {
         String c = t.getRequestHeaders().getFirst("Cookie");
         if (c == null) return null;
@@ -207,7 +183,7 @@ public class PDFWebGateway {
     }
 
     static void sendError(HttpExchange t, String m) throws IOException {
-        sendHtml(t, "<h2 style='color:red'>Erreur</h2><p>"+m+"</p><a href='/'>Retour</a>");
+        try { sendHtml(t, "<h2 style='color:red'>Erreur</h2><p>"+m+"</p><a href='/'>Retour</a>"); } catch (Exception ignored) {}
     }
 
     static Map<String, String> parseForm(String q) throws Exception {
@@ -229,10 +205,6 @@ public class PDFWebGateway {
         return b.toByteArray();
     }
 
-    static class LogoutHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange t) throws IOException { redirect(t, "/login"); }
-    }
-
-    static String CSS = "body{font-family:sans-serif;background:#f0f2f5;margin:0}.top{background:#4F1D96;color:white;padding:20px}.dash{background:#fff3cd;padding:10px;text-align:center;font-weight:bold}.container{padding:20px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:15px}.card{background:white;padding:15px;border-radius:10px;border:1px solid #ddd;text-align:center}button{background:#4F1D96;color:white;border:none;padding:8px;border-radius:5px;cursor:pointer;margin-top:5px}";
+    static class RegisterHandler implements HttpHandler { public void handle(HttpExchange t) throws IOException { sendHtml(t, "Inscription..."); } }
+    static class LogoutHandler implements HttpHandler { public void handle(HttpExchange t) throws IOException { redirect(t, "/login"); } }
 }

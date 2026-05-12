@@ -68,6 +68,7 @@ public class PDFWebGateway {
             // Auth
             server.createContext("/login",    new LoginHandler());
             server.createContext("/logout",   new LogoutHandler());
+            server.createContext("/register", new RegisterHandler());
             // Pages principales
             server.createContext("/",         new UIHandler());
             server.createContext("/admin",    new AdminHandler());
@@ -239,15 +240,15 @@ public class PDFWebGateway {
                 + errorMsg
                 + "<form method='POST' action='/login'>"
                 + "<label>Nom d'utilisateur</label>"
-                + "<input type='text' name='username' placeholder='admin ou user' required autofocus>"
+                + "<input type='text' name='username' placeholder='Votre nom d''utilisateur' required autofocus>"
                 + "<label>Mot de passe</label>"
                 + "<input type='password' name='password' placeholder='••••••••' required>"
                 + "<button type='submit'>Se connecter →</button>"
                 + "</form>"
-                + "<div class='hint'><b>Comptes de démonstration :</b>"
-                + "<span>👑 admin / admin123 → Interface administrateur</span>"
-                + "<span>👤 user / user123 → Interface utilisateur</span>"
-                + "</div>"
+                + "<p style='text-align:center;margin-top:20px;font-size:13px;color:#9CA3AF'>"
+                + "Pas encore de compte ? "
+                + "<a href='/register' style='color:#7C3AED;font-weight:600;text-decoration:none'>Créer un compte</a>"
+                + "</p>"
                 + "</div></body></html>";
         }
     }
@@ -261,6 +262,85 @@ public class PDFWebGateway {
             if (sid != null) SESSIONS.remove(sid);
             t.getResponseHeaders().set("Set-Cookie", "session=; Path=/; Max-Age=0");
             redirect(t, "/login");
+        }
+    }
+
+
+    // ══════════════════════════════════════════════════════════
+    //  INSCRIPTION
+    // ══════════════════════════════════════════════════════════
+    static class RegisterHandler implements HttpHandler {
+        public void handle(HttpExchange t) throws IOException {
+            String method = t.getRequestMethod();
+            if ("GET".equalsIgnoreCase(method)) {
+                if (isLoggedIn(t)) { redirect(t, "/"); return; }
+                String msg = t.getRequestURI().getQuery() != null && t.getRequestURI().getQuery().contains("exists")
+                    ? "<div style=\'background:#FEE2E2;border:1px solid #FCA5A5;color:#991B1B;padding:12px 16px;border-radius:10px;font-size:13px;margin-bottom:16px\'>Ce nom d'utilisateur existe déjà.</div>"
+                    : "";
+                sendHtml(t, registerPage(msg));
+            } else if ("POST".equalsIgnoreCase(method)) {
+                try {
+                    byte[] body = readAllBytes(t.getRequestBody());
+                    Map<String,String> params; try { params = parseFormBody(new String(body, "UTF-8")); } catch (Exception ex) { redirect(t, "/register"); return; }
+                    String username = params.getOrDefault("username", "").trim();
+                    String password = params.getOrDefault("password", "");
+                    String confirm  = params.getOrDefault("confirm",  "");
+                    if (username.isEmpty() || password.isEmpty() || !password.equals(confirm)) {
+                        redirect(t, "/register?error=1"); return;
+                    }
+                    if (USERS.containsKey(username)) {
+                        redirect(t, "/register?exists=1"); return;
+                    }
+                    USERS.put(username, password);
+                    ROLES.put(username, "user");
+                    String sid = UUID.randomUUID().toString();
+                    SESSIONS.put(sid, "user");
+                    t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
+                    redirect(t, "/");
+                } catch (Exception e) { sendError(t, e.getMessage()); }
+            } else {
+                t.sendResponseHeaders(405, -1);
+                t.getResponseBody().close();
+            }
+        }
+
+        static String registerPage(String errorMsg) {
+            return "<!DOCTYPE html><html lang='fr'><head>"
+                + "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                + "<title>Inscription - Studio PDF CORBA</title>"
+                + "<link href=\'https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap\' rel='stylesheet'>"
+                + "<style>"
+                + "*{box-sizing:border-box;margin:0;padding:0;font-family:'Inter',sans-serif}"
+                + "body{background:linear-gradient(135deg,#4F1D96 0%,#6D28D9 50%,#8B5CF6 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}"
+                + ".card{background:#fff;border-radius:24px;padding:40px;width:100%;max-width:400px;box-shadow:0 40px 80px rgba(79,29,150,0.3)}"
+                + ".logo{width:52px;height:52px;background:linear-gradient(135deg,#6D28D9,#8B5CF6);border-radius:16px;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:22px}"
+                + "h1{text-align:center;font-size:22px;font-weight:700;color:#1E1B4B;margin-bottom:4px}"
+                + ".sub{text-align:center;font-size:13px;color:#9CA3AF;margin-bottom:28px}"
+                + "label{font-size:11px;font-weight:600;color:#6B7280;display:block;margin-bottom:6px;letter-spacing:1px;text-transform:uppercase}"
+                + "input{width:100%;padding:12px 16px;border:1.5px solid #EDE9FE;border-radius:12px;font-size:14px;color:#1E1B4B;outline:none;font-family:inherit;background:#F8F7FF;margin-bottom:16px;transition:0.2s}"
+                + "input:focus{border-color:#7C3AED;background:#fff}"
+                + "button{width:100%;background:linear-gradient(135deg,#6D28D9,#7C3AED);color:#fff;border:none;padding:14px;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;margin-top:4px}"
+                + "button:hover{opacity:0.9;transform:translateY(-1px)}"
+                + "</style></head><body>"
+                + "<div class='card'>"
+                + "<div class='logo'>✨</div>"
+                + "<h1>Créer un compte</h1>"
+                + "<p class='sub'>Rejoignez Studio PDF CORBA</p>"
+                + errorMsg
+                + "<form method='POST' action='/register'>"
+                + "<label>Nom d'utilisateur</label>"
+                + "<input type='text' name='username' placeholder=\'Choisissez un identifiant\' required autofocus>"
+                + "<label>Mot de passe</label>"
+                + "<input type='password' name='password' placeholder=\'Mot de passe\' required>"
+                + "<label>Confirmer le mot de passe</label>"
+                + "<input type='password' name='confirm' placeholder=\'Confirmer\' required>"
+                + "<button type='submit'>Créer mon compte →</button>"
+                + "</form>"
+                + "<p style=\'text-align:center;margin-top:20px;font-size:13px;color:#9CA3AF\'>"
+                + "Déjà un compte ? "
+                + "<a href='/login' style=\'color:#7C3AED;font-weight:600;text-decoration:none\'>Se connecter</a>"
+                + "</p>"
+                + "</div></body></html>";
         }
     }
 

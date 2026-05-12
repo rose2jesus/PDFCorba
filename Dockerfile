@@ -6,7 +6,7 @@ COPY lib/ ./lib/
 RUN mkdir -p bin
 
 # Compilation
-RUN javac -d bin -cp "lib/*" \
+RUN javac -encoding UTF-8 -d bin -cp "lib/*" \
     src/PDFApp/*.java \
     src/PDFServer/PDFServiceImpl.java \
     src/PDFServer/PDFWebGateway.java \

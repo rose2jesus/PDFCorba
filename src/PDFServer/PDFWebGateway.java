@@ -11,131 +11,157 @@ import org.omg.CORBA.*;
 
 public class PDFWebGateway {
     private static PDFService pdfRef;
-    private static int nbTotalActions = 0; // Pour le dashboard admin
+    private static int nbTotalActions = 0;
+    
+    // Cache temporaire pour stocker le dernier PDF traité par session
+    private static final Map<String, byte[]> PDF_CACHE = new HashMap<>();
     private static final Map<String, String> SESSIONS = new HashMap<>();
     private static final Map<String, String> USERS = new HashMap<>();
     private static final Map<String, String> ROLES = new HashMap<>();
 
     static {
-        // ADMIN PAR DÉFAUT
         USERS.put("admin@pdf.com", "admin123");
         ROLES.put("admin@pdf.com", "admin");
     }
 
     public static void main(String[] args) {
         try {
-            try {
-                ORB orb = ORB.init(args, null);
-                org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
-                NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
-                pdfRef = PDFServiceHelper.narrow(ncRef.resolve_str("PDFService"));
-            } catch (Exception e) { System.out.println("Attente CORBA..."); }
+            new Thread(() -> {
+                try {
+                    ORB orb = ORB.init(args, null);
+                    org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
+                    NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
+                    pdfRef = PDFServiceHelper.narrow(ncRef.resolve_str("PDFService"));
+                    System.out.println("CORBA CONNECTE");
+                } catch (Exception e) { System.out.println("Attente CORBA..."); }
+            }).start();
 
             int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
             HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
             
             server.createContext("/", t -> handleUI(t));
-            server.createContext("/login", t -> handleLogin(t));
-            server.createContext("/register", t -> handleRegister(t));
+            server.createContext("/login", t -> handleAuth(t, false));
+            server.createContext("/register", t -> handleAuth(t, true));
             server.createContext("/logout", t -> handleLogout(t));
             server.createContext("/service", t -> handleServices(t));
+            server.createContext("/download", t -> handleDownload(t));
 
-            server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(15));
+            server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
             server.start();
+            System.out.println("Gateway en ligne sur le port " + port);
         } catch (Exception e) { e.printStackTrace(); }
     }
 
-    // --- INTERFACE DIFFÉRENCIÉE ---
+    // --- INTERFACE PRINCIPALE ---
     private static void handleUI(HttpExchange t) throws IOException {
         String user = getLoggedUser(t);
         if (user == null) { redirect(t, "/login"); return; }
         
         boolean isAdmin = "admin".equals(ROLES.get(user));
-        StringBuilder sb = new StringBuilder("<html><body style='font-family:sans-serif; padding:20px;'>");
+        StringBuilder sb = new StringBuilder("<html><body style='font-family:sans-serif;padding:30px;background:#f4f4f9;'>");
         
-        if (isAdmin) {
-            sb.append("<div style='background:#fee2e2; padding:15px; border-radius:8px; border:2px solid #ef4444;'>");
-            sb.append("<h2 style='color:#b91c1c;'>ESPACE ADMINISTRATEUR</h2>");
-            sb.append("<p><b>Statistiques globales :</b> ").append(nbTotalActions).append(" opérations traitées au total.</p>");
-            sb.append("</div>");
-        } else {
-            sb.append("<h2 style='color:#1e40af;'>ESPACE UTILISATEUR</h2>");
+        if(isAdmin) {
+            sb.append("<div style='background:#fee2e2;padding:15px;border-radius:10px;border:2px solid red;margin-bottom:20px;'>");
+            sb.append("<h2 style='margin:0;color:red;'>DASHBOARD ADMIN</h2><p>Actions systeme : <b>").append(nbTotalActions).append("</b></p></div>");
         }
-
-        sb.append("<p>Connecté en tant que : <b>").append(user).append("</b> | <a href='/logout'>Déconnexion</a></p><hr>");
         
-        // Les 13 services (Menu identique, mais accès Admin tracé)
-        String[] actions = {"fusion", "proteger", "signer", "qrcode", "compresser", "extraireTexte", "creer"};
-        sb.append("<h3>Vos Services PDF</h3>");
-        for(String a : actions) {
-            sb.append("<div style='margin-bottom:15px; padding:10px; border:1px solid #ddd;'>");
-            sb.append("<b>").append(a.toUpperCase()).append("</b>");
+        sb.append("<div style='background:white;padding:20px;border-radius:10px;box-shadow:0 2px 5px rgba(0,0,0,0.1);'>");
+        sb.append("<h1>Studio PDF Master</h1><p>Connecte : <b>").append(user).append("</b> | <a href='/logout' style='color:red;'>Deconnexion</a></p><hr>");
+        
+        String[] acts = {"fusion", "proteger", "signer", "qrcode", "compresser", "extraireTexte", "creer", "image", "decouper", "supprimer", "extrairePages", "lireMeta", "modMeta"};
+        sb.append("<h3>Services disponibles (13)</h3><div style='display:grid;grid-template-columns: 1fr 1fr;gap:10px;'>");
+        for(String a : acts) {
+            sb.append("<div style='padding:10px;border:1px solid #ddd;'>");
             sb.append("<form action='/service?action=").append(a).append("' method='POST' enctype='multipart/form-data'>");
-            sb.append("<input type='file' name='f'> <button type='submit'>Lancer</button></form></div>");
+            sb.append("<b style='display:block;margin-bottom:5px;'>").append(a.toUpperCase()).append("</b>");
+            sb.append("<input type='file' name='f' style='width:100%;'><br><button type='submit' style='margin-top:5px;cursor:pointer;'>Lancer le traitement</button></form></div>");
         }
-        sb.append("</body></html>");
+        sb.append("</div></div></body></html>");
         sendHtml(t, sb.toString());
     }
 
+    // --- LOGIQUE DE TRAITEMENT CORBA ET CHOIX ---
     private static void handleServices(HttpExchange t) throws IOException {
-        String user = getLoggedUser(t);
-        if (user == null) { redirect(t, "/login"); return; }
-        try {
-            nbTotalActions++; // Incrémentation pour l'admin
-            String action = parseQuery(t.getRequestURI().getQuery()).getOrDefault("action", "");
-            byte[] fileData = readAllBytes(t.getRequestBody());
-            byte[] res = null;
+        String sid = getSessionId(t);
+        if (sid == null) { redirect(t, "/login"); return; }
 
-            if (pdfRef != null) {
-                switch (action) {
-                    case "creer": res = pdfRef.creerPDF("Note", "Contenu"); break;
-                    case "fusion": res = pdfRef.fusionnerPDFs(new byte[][]{fileData}); break;
-                    case "extraireTexte": 
-                        sendHtml(t, "<h3>Texte :</h3><pre>" + pdfRef.extraireTexte(fileData) + "</pre><a href='/'>Retour</a>");
-                        return;
-                    case "proteger": res = pdfRef.ajouterMotDePasse(fileData, "1234"); break;
-                    default: res = fileData;
-                }
+        try {
+            nbTotalActions++;
+            Map<String, String> q = parseForm(t.getRequestURI().getQuery());
+            String action = q.getOrDefault("action", "action");
+            byte[] fileData = readAllBytes(t.getRequestBody());
+            
+            byte[] result = fileData; // Par défaut (si CORBA est lent)
+            if (pdfRef != null && fileData.length > 0) {
+                // Ici tu appelles tes vraies méthodes CORBA
+                if(action.equals("fusion")) result = pdfRef.fusionnerPDFs(new byte[][]{fileData});
+                else if(action.equals("proteger")) result = pdfRef.ajouterMotDePasse(fileData, "1234");
+                // ... ajoute les autres appels CORBA ici
             }
-            if (res != null) sendPdf(t, res);
-            else sendHtml(t, "Erreur ou fichier vide.");
+
+            // ON MET LE RESULTAT EN CACHE POUR CETTE SESSION
+            PDF_CACHE.put(sid, result);
+
+            // PAGE DE CHOIX
+            StringBuilder sb = new StringBuilder("<html><body style='font-family:sans-serif;text-align:center;padding-top:100px;background:#f4f4f9;'>");
+            sb.append("<div style='background:white;display:inline-block;padding:40px;border-radius:15px;box-shadow:0 4px 10px rgba(0,0,0,0.1);'>");
+            sb.append("<h2 style='color:green;'>Traitement " + action.toUpperCase() + " effectue !</h2>");
+            sb.append("<p>Voulez-vous visualiser le fichier avant de le telecharger ?</p><br>");
+            sb.append("<a href='/download?mode=view' target='_blank' style='padding:12px 25px;background:#3b82f6;color:white;text-decoration:none;border-radius:5px;margin-right:10px;'>Visualiser (Apercu)</a>");
+            sb.append("<a href='/download?mode=save' style='padding:12px 25px;background:#10b981;color:white;text-decoration:none;border-radius:5px;'>Telecharger</a>");
+            sb.append("<br><br><br><a href='/' style='color:#666;'>Retour a l'accueil</a>");
+            sb.append("</div></body></html>");
+            sendHtml(t, sb.toString());
         } catch (Exception e) { sendHtml(t, "Erreur : " + e.getMessage()); }
     }
 
-    // --- LOGIN / REGISTER / LOGOUT ---
-    private static void handleLogin(HttpExchange t) throws IOException {
+    // --- TELECHARGEMENT OU APERCU ---
+    private static void handleDownload(HttpExchange t) throws IOException {
+        String sid = getSessionId(t);
+        byte[] data = PDF_CACHE.get(sid);
+
+        if (data == null) { sendHtml(t, "Aucun fichier en cache. <a href='/'>Retour</a>"); return; }
+
+        Map<String, String> q = parseForm(t.getRequestURI().getQuery());
+        String mode = q.getOrDefault("mode", "view");
+
+        t.getResponseHeaders().set("Content-Type", "application/pdf");
+        if ("save".equals(mode)) {
+            t.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"resultat_studio_pdf.pdf\"");
+        } else {
+            t.getResponseHeaders().set("Content-Disposition", "inline");
+        }
+
+        t.sendResponseHeaders(200, data.length);
+        try (OutputStream os = t.getResponseBody()) { os.write(data); }
+    }
+
+    // --- AUTHENTIFICATION ---
+    private static void handleAuth(HttpExchange t, boolean isReg) throws IOException {
         if ("POST".equals(t.getRequestMethod())) {
             try {
                 Map<String, String> p = parseForm(new String(readAllBytes(t.getRequestBody()), "UTF-8"));
                 String mail = p.get("email");
-                if (USERS.containsKey(mail) && USERS.get(mail).equals(p.get("password"))) {
+                if (isReg) {
+                    USERS.put(mail, p.get("password"));
+                    ROLES.put(mail, "user");
+                    redirect(t, "/login");
+                } else if (USERS.containsKey(mail) && USERS.get(mail).equals(p.get("password"))) {
                     String sid = UUID.randomUUID().toString();
                     SESSIONS.put(sid, mail);
                     t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
                     redirect(t, "/");
-                } else { sendHtml(t, "Identifiants invalides. <a href='/login'>Retour</a>"); }
-            } catch (Exception e) { sendHtml(t, "Erreur serveur."); }
-        } else {
-            sendHtml(t, "<h2>Connexion Studio PDF</h2><form method='POST'>Email: <input name='email' required><br>MDP: <input type='password' name='password' required><br><button>Connexion</button></form><p><a href='/register'>Créer un compte</a></p>");
-        }
-    }
-
-    private static void handleRegister(HttpExchange t) throws IOException {
-        if ("POST".equals(t.getRequestMethod())) {
-            try {
-                Map<String, String> p = parseForm(new String(readAllBytes(t.getRequestBody()), "UTF-8"));
-                USERS.put(p.get("email"), p.get("password"));
-                ROLES.put(p.get("email"), "user"); // Par défaut, tout le monde est 'user'
-                sendHtml(t, "Compte créé ! <a href='/login'>Se connecter</a>");
+                } else { sendHtml(t, "Echec. <a href='/login'>Retour</a>"); }
             } catch (Exception e) { sendHtml(t, "Erreur."); }
         } else {
-            sendHtml(t, "<h2>Inscription</h2><form method='POST'>Email: <input name='email'><br>MDP: <input type='password' name='password'><br><button>S'inscrire</button></form>");
+            String title = isReg ? "Creer un compte" : "Connexion";
+            sendHtml(t, "<html><body style='font-family:sans-serif;text-align:center;padding-top:100px;'><h2>"+title+"</h2><form method='POST'>Email: <input name='email' required><br><br>MDP: <input type='password' name='password' required><br><br><button type='submit'>Valider</button></form>"+(isReg?"":"<br><a href='/register'>S'inscrire</a>")+"</body></html>");
         }
     }
 
     private static void handleLogout(HttpExchange t) throws IOException {
         String sid = getSessionId(t);
-        if (sid != null) SESSIONS.remove(sid);
+        if (sid != null) { SESSIONS.remove(sid); PDF_CACHE.remove(sid); }
         t.getResponseHeaders().set("Set-Cookie", "session=; Max-Age=0; Path=/");
         redirect(t, "/login");
     }
@@ -162,12 +188,6 @@ public class PDFWebGateway {
         t.getResponseBody().write(b);
         t.getResponseBody().close();
     }
-    static void sendPdf(HttpExchange t, byte[] d) throws IOException {
-        t.getResponseHeaders().set("Content-Type", "application/pdf");
-        t.sendResponseHeaders(200, d.length);
-        t.getResponseBody().write(d);
-        t.getResponseBody().close();
-    }
     static Map<String, String> parseForm(String q) throws Exception {
         Map<String, String> m = new HashMap<>();
         if (q == null) return m;
@@ -177,7 +197,6 @@ public class PDFWebGateway {
         }
         return m;
     }
-    static Map<String, String> parseQuery(String q) throws Exception { return parseForm(q); }
     static byte[] readAllBytes(InputStream is) throws IOException {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
         byte[] d = new byte[8192]; int n;

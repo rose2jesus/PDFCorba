@@ -1,0 +1,8 @@
+bin/
+*.class
+*.jar
+resultat_test.pdf
+orb.db
+__pycache__/
+*.pyc
+.env

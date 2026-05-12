@@ -43,7 +43,17 @@ public class PDFWebGateway {
     static String getRole(HttpExchange t) {
         String sid = getSessionId(t);
         if (sid == null) return null;
-        return SESSIONS.get(sid);
+        String val = SESSIONS.get(sid);
+        if (val == null) return null;
+        return val.contains(":") ? val.split(":")[0] : val;
+    }
+
+    static String getUsername(HttpExchange t) {
+        String sid = getSessionId(t);
+        if (sid == null) return null;
+        String val = SESSIONS.get(sid);
+        if (val == null) return null;
+        return val.contains(":") ? val.split(":", 2)[1] : val;
     }
 
     static boolean isLoggedIn(HttpExchange t) { return getRole(t) != null; }
@@ -199,7 +209,7 @@ public class PDFWebGateway {
                 if (storedPwd != null && storedPwd.equals(password)) {
                     String sid = UUID.randomUUID().toString();
                     String role = ROLES.get(username);
-                    SESSIONS.put(sid, role);
+                    SESSIONS.put(sid, role + ":" + username);
                     t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
                     if ("admin".equals(role)) { redirect(t, "/admin"); }
                     else                      { redirect(t, "/");      }
@@ -294,7 +304,7 @@ public class PDFWebGateway {
                     USERS.put(username, password);
                     ROLES.put(username, "user");
                     String sid = UUID.randomUUID().toString();
-                    SESSIONS.put(sid, "user");
+                    SESSIONS.put(sid, "user:" + username);
                     t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
                     redirect(t, "/");
                 } catch (Exception e) { sendError(t, e.getMessage()); }
@@ -525,6 +535,37 @@ public class PDFWebGateway {
     }
 
     // ══════════════════════════════════════════════════════════
+    //  CONSTRUCTION DU TABLEAU UTILISATEURS
+    // ══════════════════════════════════════════════════════════
+    static String buildUserRows() {
+        // Collecter les usernames actuellement connectés
+        Set<String> connected = new java.util.HashSet<>();
+        for (String val : SESSIONS.values()) {
+            if (val.contains(":")) connected.add(val.split(":", 2)[1]);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String,String> entry : USERS.entrySet()) {
+            String uname = entry.getKey();
+            String role  = ROLES.getOrDefault(uname, "user");
+            boolean isAdmin = "admin".equals(role);
+            boolean isConnected = connected.contains(uname);
+            String roleCell = isAdmin
+                ? "<span class='role-badge role-admin'>Administrateur</span>"
+                : "<span class='role-badge role-user'>Utilisateur</span>";
+            String statusCell = isConnected
+                ? "<span style='color:#059669;font-weight:600;font-size:12px'>&#9679; Connecté</span>"
+                : "<span style='color:#9CA3AF;font-weight:500;font-size:12px'>&#9675; Hors ligne</span>";
+            sb.append("<tr>")
+              .append("<td><b>").append(escapeHtml(uname)).append("</b></td>")
+              .append("<td>").append(roleCell).append("</td>")
+              .append("<td>").append(statusCell).append("</td>")
+              .append("</tr>");
+        }
+        return sb.toString();
+    }
+
+
+    // ══════════════════════════════════════════════════════════
     //  PAGE ADMINISTRATEUR (/admin)
     // ══════════════════════════════════════════════════════════
     static class AdminHandler implements HttpHandler {
@@ -574,15 +615,14 @@ public class PDFWebGateway {
                 + "<div class='stat st4'><div class='stat-l'>Protégés</div><div class='stat-n'>" + nbProtections + "</div><div class='stat-s'>Session actuelle</div></div>"
                 + "</div>"
 
-                // GESTION UTILISATEURS
+                // GESTION UTILISATEURS - dynamique
                 + "<div class='section-card'>"
                 + "<h2>Gestion des utilisateurs</h2>"
-                + "<p class='sub'>Comptes enregistrés dans le système</p>"
+                + "<p class='sub'>" + USERS.size() + " compte(s) enregistré(s) &mdash; " + SESSIONS.size() + " session(s) active(s)</p>"
                 + "<table class='admin-table'>"
-                + "<thead><tr><th>Nom d'utilisateur</th><th>Rôle</th><th>Statut</th><th>Sessions actives</th></tr></thead>"
+                + "<thead><tr><th>Nom d'utilisateur</th><th>Rôle</th><th>Statut</th></tr></thead>"
                 + "<tbody>"
-                + "<tr><td><b>admin</b></td><td><span class='role-badge role-admin'>Administrateur</span></td><td><span style='color:#059669;font-weight:600;font-size:12px'>● Actif</span></td><td style='font-size:12px;color:#9CA3AF'>Session courante</td></tr>"
-                + "<tr><td><b>user</b></td><td><span class='role-badge role-user'>Utilisateur</span></td><td><span style='color:#059669;font-weight:600;font-size:12px'>● Actif</span></td><td style='font-size:12px;color:#9CA3AF'>" + (SESSIONS.containsValue("user") ? "1 session" : "Aucune") + "</td></tr>"
+                + buildUserRows()
                 + "</tbody></table>"
                 + "</div>"
 

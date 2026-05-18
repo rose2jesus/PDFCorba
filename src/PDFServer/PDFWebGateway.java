@@ -5,91 +5,28 @@ import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.util.*;
-import java.sql.*;
 import PDFApp.*;
 import org.omg.CosNaming.*;
 import org.omg.CORBA.*;
-import org.mindrot.jbcrypt.BCrypt;
 
 public class PDFWebGateway {
     private static PDFService pdfRef;
     private static int nbCrees = 0, nbExtractions = 0, nbFusions = 0, nbProtections = 0;
 
-    // Sessions volatiles (conservées en mémoire pour la navigation)
+    // ══════════════════════════════════════════════════════════
+    //  COMPTES (admin / utilisateur)
+    //  admin  : mot de passe "admin123"
+    //  user   : mot de passe "user123"
+    // ══════════════════════════════════════════════════════════
+    private static final Map<String,String> USERS = new HashMap<>();
+    private static final Map<String,String> ROLES  = new HashMap<>();
     private static final Map<String,String> SESSIONS = Collections.synchronizedMap(new HashMap<>());
 
-    // ── Connexion PostgreSQL robuste pour Render ───────────────────────────
-    private static Connection getDbConnection() throws SQLException {
-        String dbUrl = System.getenv("DATABASE_URL");
-        
-        if (dbUrl == null) {
-            // Fallback local si la variable n'est pas définie
-            dbUrl = "jdbc:postgresql://localhost:5432/pdfcorba_db";
-            return DriverManager.getConnection(dbUrl, "postgres", "password");
-        }
-
-        // Si Render fournit une URL de type postgres://, on la convertit proprement pour JDBC
-        if (dbUrl.startsWith("postgres://")) {
-            try {
-                String cleanUri = dbUrl.substring(11);
-                String[] authAndHost = cleanUri.split("@");
-                String[] userAndPass = authAndHost[0].split(":");
-                String[] hostAndDb = authAndHost[1].split("/");
-                
-                String username = userAndPass[0];
-                String password = userAndPass[1];
-                String hostAndPort = hostAndDb[0];
-                String dbName = hostAndDb[1];
-                
-                String jdbcUrl = "jdbc:postgresql://" + hostAndPort + "/" + dbName;
-                if (!jdbcUrl.contains("sslmode")) {
-                    jdbcUrl += "?sslmode=require";
-                }
-                return DriverManager.getConnection(jdbcUrl, username, password);
-            } catch (Exception e) {
-                String fallbackUrl = dbUrl.replace("postgres://", "jdbc:postgresql://");
-                if (!fallbackUrl.contains("sslmode")) {
-                    fallbackUrl += "?sslmode=require";
-                }
-                return DriverManager.getConnection(fallbackUrl);
-            }
-        }
-        return DriverManager.getConnection(dbUrl);
-    }
-
-    // ── Initialisation de la base de données ──────────────────────────────
-    private static void initDatabase() {
-        String createTableSQL = "CREATE TABLE IF NOT EXISTS users ("
-                + "username VARCHAR(50) PRIMARY KEY, "
-                + "password VARCHAR(255) NOT NULL, "
-                + "role VARCHAR(20) NOT NULL"
-                + ");";
-        try (Connection conn = getDbConnection(); Statement stmt = conn.createStatement()) {
-            stmt.execute(createTableSQL);
-            
-            // Insertion des comptes par défaut si la table est vide
-            try (ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM users")) {
-                if (rs.next() && rs.getInt(1) == 0) {
-                    try (PreparedStatement pstmt = conn.prepareStatement("INSERT INTO users VALUES (?, ?, ?)")) {
-                        // admin / admin123
-                        pstmt.setString(1, "admin");
-                        pstmt.setString(2, BCrypt.hashpw("admin123", BCrypt.gensalt()));
-                        pstmt.setString(3, "admin");
-                        pstmt.executeUpdate();
-                        
-                        // user / user123
-                        pstmt.setString(1, "user");
-                        pstmt.setString(2, BCrypt.hashpw("user123", BCrypt.gensalt()));
-                        pstmt.setString(3, "user");
-                        pstmt.executeUpdate();
-                    }
-                }
-            }
-            System.out.println("Base de données PostgreSQL initialisée avec succès.");
-        } catch (Exception e) {
-            System.err.println("Erreur d'initialisation de la base de données : " + e.getMessage());
-            e.printStackTrace();
-        }
+    static {
+        USERS.put("admin", "admin123");
+        USERS.put("user",  "user123");
+        ROLES.put("admin", "admin");
+        ROLES.put("user",  "user");
     }
 
     // ── Session helpers ──────────────────────────────────────
@@ -111,6 +48,14 @@ public class PDFWebGateway {
         return val.contains(":") ? val.split(":")[0] : val;
     }
 
+    static String getUsername(HttpExchange t) {
+        String sid = getSessionId(t);
+        if (sid == null) return null;
+        String val = SESSIONS.get(sid);
+        if (val == null) return null;
+        return val.contains(":", 2) ? val.split(":", 2)[1] : val;
+    }
+
     static boolean isLoggedIn(HttpExchange t) { return getRole(t) != null; }
 
     static void redirect(HttpExchange t, String path) throws IOException {
@@ -124,23 +69,20 @@ public class PDFWebGateway {
     // ══════════════════════════════════════════════════════════
     public static void main(String[] args) throws Exception {
         try {
-            // Charger le driver explicitement pour éviter les soucis de classpath sous Docker
-            Class.forName("org.postgresql.Driver");
-            
-            // Initialiser les tables PostgreSQL
-            initDatabase();
-
             ORB orb = ORB.init(args, null);
             org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
             NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
             pdfRef = PDFServiceHelper.narrow(ncRef.resolve_str("PDFService"));
 
             HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
+            // Auth
             server.createContext("/login",    new LoginHandler());
             server.createContext("/logout",   new LogoutHandler());
             server.createContext("/register", new RegisterHandler());
+            // Pages principales
             server.createContext("/",         new UIHandler());
             server.createContext("/admin",    new AdminHandler());
+            // Outils
             server.createContext("/create",   new GenerateHandler());
             server.createContext("/extract",  new ExtractHandler());
             server.createContext("/image",    new ToImageHandler());
@@ -239,7 +181,7 @@ public class PDFWebGateway {
         + "</style>";
 
     // ══════════════════════════════════════════════════════════
-    //  PAGE DE CONNEXION (Vérification PostgreSQL + BCrypt)
+    //  PAGE DE CONNEXION
     // ══════════════════════════════════════════════════════════
     static class LoginHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
@@ -254,33 +196,25 @@ public class PDFWebGateway {
                     ? "<div style='background:#FEE2E2;border:1px solid #FCA5A5;color:#991B1B;padding:12px 16px;border-radius:10px;font-size:13px;margin-bottom:16px'>Identifiants incorrects. Veuillez réessayer.</div>"
                     : "";
 
-                sendHtml(t, loginPage(msg));
+                String html = loginPage(msg);
+                sendHtml(t, html);
             } else if ("POST".equalsIgnoreCase(method)) {
                 byte[] body = readAllBytes(t.getRequestBody());
-                Map<String,String> params; 
-                try { params = parseFormBody(new String(body, "UTF-8")); } catch (Exception ex) { redirect(t, "/login?error=1"); return; }
-                String username = params.getOrDefault("username", "").trim();
+                Map<String,String> params; try { params = parseFormBody(new String(body, "UTF-8")); } catch (Exception ex) { redirect(t, "/login?error=1"); return; }
+                String username = params.getOrDefault("username", "");
                 String password = params.getOrDefault("password", "");
 
-                // Vérification en base PostgreSQL avec BCrypt
-                String query = "SELECT password, role FROM users WHERE username = ?";
-                try (Connection conn = getDbConnection(); PreparedStatement pstmt = conn.prepareStatement(query)) {
-                    pstmt.setString(1, username);
-                    try (ResultSet rs = pstmt.executeQuery()) {
-                        if (rs.next() && BCrypt.checkpw(password, rs.getString("password"))) {
-                            String role = rs.getString("role");
-                            String sid = UUID.randomUUID().toString();
-                            SESSIONS.put(sid, role + ":" + username);
-                            t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
-                            if ("admin".equals(role)) { redirect(t, "/admin"); }
-                            else                      { redirect(t, "/");      }
-                            return;
-                        }
-                    }
-                } catch (Exception e) {
-                    e.printStackTrace();
+                String storedPwd = USERS.get(username);
+                if (storedPwd != null && storedPwd.equals(password)) {
+                    String sid = UUID.randomUUID().toString();
+                    String role = ROLES.get(username);
+                    SESSIONS.put(sid, role + ":" + username);
+                    t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
+                    if ("admin".equals(role)) { redirect(t, "/admin"); }
+                    else                      { redirect(t, "/");      }
+                } else {
+                    redirect(t, "/login?error=1");
                 }
-                redirect(t, "/login?error=1");
             } else {
                 t.sendResponseHeaders(405, -1);
                 t.getResponseBody().close();
@@ -304,6 +238,9 @@ public class PDFWebGateway {
                 + "input:focus{border-color:#7C3AED;background:#fff}"
                 + "button{width:100%;background:linear-gradient(135deg,#6D28D9,#7C3AED);color:#fff;border:none;padding:14px;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;margin-top:4px}"
                 + "button:hover{opacity:0.9;transform:translateY(-1px)}"
+                + ".hint{margin-top:20px;background:#F5F3FF;border-radius:12px;padding:14px;font-size:12px;color:#6B7280}"
+                + ".hint b{color:#5B21B6;display:block;margin-bottom:6px}"
+                + ".hint span{display:block;margin-bottom:3px}"
                 + "</style></head><body>"
                 + "<div class='card'>"
                 + "<div class='logo'>📄</div>"
@@ -312,7 +249,7 @@ public class PDFWebGateway {
                 + errorMsg
                 + "<form method='POST' action='/login'>"
                 + "<label>Nom d'utilisateur</label>"
-                + "<input type='text' name='username' placeholder='Votre nom d\\'utilisateur' required autofocus>"
+                + "<input type='text' name='username' placeholder='Votre nom d''utilisateur' required autofocus>"
                 + "<label>Mot de passe</label>"
                 + "<input type='password' name='password' placeholder='••••••••' required>"
                 + "<button type='submit'>Se connecter →</button>"
@@ -338,7 +275,7 @@ public class PDFWebGateway {
     }
 
     // ══════════════════════════════════════════════════════════
-    //  INSCRIPTION (Enregistrement persistant PostgreSQL)
+    //  INSCRIPTION
     // ══════════════════════════════════════════════════════════
     static class RegisterHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
@@ -352,38 +289,18 @@ public class PDFWebGateway {
             } else if ("POST".equalsIgnoreCase(method)) {
                 try {
                     byte[] body = readAllBytes(t.getRequestBody());
-                    Map<String,String> params; 
-                    try { params = parseFormBody(new String(body, "UTF-8")); } catch (Exception ex) { redirect(t, "/register"); return; }
+                    Map<String,String> params; try { params = parseFormBody(new String(body, "UTF-8")); } catch (Exception ex) { redirect(t, "/register"); return; }
                     String username = params.getOrDefault("username", "").trim();
                     String password = params.getOrDefault("password", "");
                     String confirm  = params.getOrDefault("confirm",  "");
-                    
                     if (username.isEmpty() || password.isEmpty() || !password.equals(confirm)) {
                         redirect(t, "/register?error=1"); return;
                     }
-
-                    try (Connection conn = getDbConnection()) {
-                        // Vérifier si l'utilisateur existe déjà
-                        String checkSQL = "SELECT username FROM users WHERE username = ?";
-                        try (PreparedStatement checkStmt = conn.prepareStatement(checkSQL)) {
-                            checkStmt.setString(1, username);
-                            try (ResultSet rs = checkStmt.executeQuery()) {
-                                if (rs.next()) {
-                                    redirect(t, "/register?exists=1"); return;
-                                }
-                            }
-                        }
-
-                        // Insertion du nouvel utilisateur haché avec BCrypt
-                        String insertSQL = "INSERT INTO users (username, password, role) VALUES (?, ?, ?)";
-                        try (PreparedStatement insertStmt = conn.prepareStatement(insertSQL)) {
-                            insertStmt.setString(1, username);
-                            insertStmt.setString(2, BCrypt.hashpw(password, BCrypt.gensalt()));
-                            insertStmt.setString(3, "user");
-                            insertStmt.executeUpdate();
-                        }
+                    if (USERS.containsKey(username)) {
+                        redirect(t, "/register?exists=1"); return;
                     }
-
+                    USERS.put(username, password);
+                    ROLES.put(username, "user");
                     String sid = UUID.randomUUID().toString();
                     SESSIONS.put(sid, "user:" + username);
                     t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
@@ -436,46 +353,202 @@ public class PDFWebGateway {
     }
 
     // ══════════════════════════════════════════════════════════
-    //  CONSTRUCTION DU TABLEAU UTILISATEURS DEPUIS POSTGRESQL
+    //  HELPERS HTML
     // ══════════════════════════════════════════════════════════
-    static String buildUserRows(int[] countOut) {
+    static String tc(String grad, String title, String desc, String tag, String tagStyle, String modalId) {
+        return "<div class='tc' onclick='openM(\"" + modalId + "\")'>"
+            + "<div class='tc-bar' style='background:" + grad + "'></div>"
+            + "<h3>" + title + "</h3><p>" + desc + "</p>"
+            + "<span class='tc-tag' style='" + tagStyle + "'>" + tag + "</span>"
+            + "</div>";
+    }
+
+    static String uploadZone(String id, String name, boolean multi) {
+        String mult = multi ? " multiple" : "";
+        return "<div class='upload-zone' onclick='document.getElementById(\"" + id + "\").click()'>"
+            + "<p>Choisir un PDF</p><small id='lbl-" + id + "'>Cliquer pour parcourir</small></div>"
+            + "<input type='file' id='" + id + "' name='" + name + "' accept='.pdf'" + mult
+            + " style='display:none' onchange='showName(\"lbl-" + id + "\",this)'>";
+    }
+
+    static String modal(String id, String title, String sub, String action, String content) {
+        return "<div class='overlay' id='" + id + "'><div class='modal'>"
+            + "<h2>" + title + "</h2><p class='msub'>" + sub + "</p>"
+            + "<form method='post' enctype='multipart/form-data' action='" + action + "'>"
+            + content
+            + "<div class='btn-row'>"
+            + "<button class='btn-cancel' type='button' onclick='closeM(\"" + id + "\")'>Annuler</button>"
+            + "<button class='btn-ok'>Confirmer</button>"
+            + "</div></form></div></div>";
+    }
+
+    static String navbarUser(String active) {
+        return "<div class='nav-links'>"
+            + "<span class='badge'><span class='dot'></span>&nbsp;Connecté</span>"
+            + (!"home".equals(active) ? "<a class='nav-link' href='/'>Accueil</a>" : "")
+            + "<a class='nav-link logout' href='/logout'>Déconnexion</a>"
+            + "</div>";
+    }
+
+    static String navbarAdmin(String active) {
+        return "<div class='nav-links'>"
+            + "<span class='badge'><span class='dot'></span>&nbsp;Admin</span>"
+            + "<a class='nav-link" + ("dash".equals(active) ? " active" : "") + "' href='/admin'>Tableau de bord</a>"
+            + "<a class='nav-link logout' href='/logout'>Déconnexion</a>"
+            + "</div>";
+    }
+
+    static String jsCommon() {
+        return "<script>"
+            + "function openM(id){document.getElementById(id).classList.add('active')}"
+            + "function closeM(id){document.getElementById(id).classList.remove('active')}"
+            + "function showName(id,input){document.getElementById(id).textContent=input.files.length>1?input.files.length+' fichiers':input.files[0]?.name||'Aucun'}"
+            + "document.querySelectorAll('.overlay').forEach(function(o){o.addEventListener('click',function(e){if(e.target===this)this.classList.remove('active')})})"
+            + "</script>";
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  PAGE UTILISATEUR (accueil /)
+    // ══════════════════════════════════════════════════════════
+    static class UIHandler implements HttpHandler {
+        public void handle(HttpExchange t) throws IOException {
+            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
+            if ("admin".equals(getRole(t))) { redirect(t, "/admin"); return; }
+
+            String html = "<!DOCTYPE html><html lang='fr'><head>"
+                + "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                + "<title>Studio PDF – Espace Utilisateur</title>"
+                + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap' rel='stylesheet'>"
+                + CSS_BASE + "</head><body>"
+
+                + "<div class='topbar' style='background:linear-gradient(135deg,#065F46 0%,#047857 40%,#059669 70%,#10B981 100%)'>"
+                + "<div class='topbar-row'>"
+                + "<div><h1>📄 Mon espace PDF</h1><p>Traitez vos documents en toute simplicité</p></div>"
+                + navbarUser("home")
+                + "</div></div>"
+
+                + "<div class='main'>"
+                + "<div style='background:#fff;border-radius:16px;padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;gap:16px;border-left:4px solid #059669'>"
+                + "<div style='width:44px;height:44px;background:linear-gradient(135deg,#D1FAE5,#6EE7B7);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px'>👤</div>"
+                + "<div><p style='font-size:14px;font-weight:600;color:#1E1B4B'>Bienvenue dans votre espace utilisateur</p>"
+                + "<p style='font-size:12px;color:#9CA3AF'>Vous pouvez utiliser tous les outils PDF disponibles ci-dessous.</p></div>"
+                + "</div>"
+
+                + "<p class='sec-label'>Outils disponibles</p>"
+                + "<div class='tools'>"
+                + tc("linear-gradient(90deg,#7C3AED,#A78BFA)", "Extraire texte",   "Lisez le contenu texte",        "Analyse",       "background:#EDE9FE;color:#5B21B6", "m-extract")
+                + tc("linear-gradient(90deg,#0EA5E9,#7DD3FC)", "En images",        "PDF vers PNG haute qualité",    "Conversion",    "background:#E0F2FE;color:#0369A1", "m-image")
+                + tc("linear-gradient(90deg,#10B981,#6EE7B7)", "Protéger",         "Chiffrement mot de passe",      "Sécurité",      "background:#D1FAE5;color:#065F46", "m-protect")
+                + tc("linear-gradient(90deg,#F59E0B,#FCD34D)", "Fusionner",        "Combiner plusieurs PDFs",       "Assemblage",    "background:#FEF3C7;color:#92400E", "m-merge")
+                + tc("linear-gradient(90deg,#EC4899,#F9A8D4)", "Découper",         "Diviser en plusieurs parties",  "Édition",       "background:#FCE7F3;color:#9D174D", "m-split")
+                + tc("linear-gradient(90deg,#EF4444,#FCA5A5)", "Supprimer pages",  "Retirer des pages précises",    "Édition",       "background:#FEE2E2;color:#991B1B", "m-delete")
+                + tc("linear-gradient(90deg,#8B5CF6,#C4B5FD)", "Extraire pages",   "Sélectionner et exporter",     "Extraction",    "background:#EDE9FE;color:#5B21B6", "m-pages")
+                + tc("linear-gradient(90deg,#14B8A6,#99F6E4)", "Compresser",       "Réduire la taille du fichier", "Optimisation",  "background:#CCFBF1;color:#0F766E", "m-compress")
+                + tc("linear-gradient(90deg,#6366F1,#A5B4FC)", "Métadonnées",      "Lire infos du document",       "Info",          "background:#EEF2FF;color:#3730A3", "m-meta")
+                + tc("linear-gradient(90deg,#D946EF,#F0ABFC)", "Modifier meta",    "Titre auteur sujet",           "Édition",       "background:#FDF4FF;color:#86198F", "m-metamod")
+                + tc("linear-gradient(90deg,#0284C7,#7DD3FC)", "QR Code",          "Insérer un QR code",           "Enrichissement","background:#E0F2FE;color:#0C4A6E", "m-qrcode")
+                + tc("linear-gradient(90deg,#059669,#6EE7B7)", "Signer",           "Signature numérique RSA",      "Sécurité",      "background:#D1FAE5;color:#065F46", "m-sign")
+                + "</div>"
+
+                + "<div class='bottom'>"
+                + "<div class='create'><h2>Créer un PDF</h2>"
+                + "<p class='sub'>Générez instantanément via le serveur CORBA</p>"
+                + "<form action='/create' method='get'>"
+                + "<div class='inp-row'>"
+                + "<input class='inp' name='titre' placeholder='Titre...'>"
+                + "<input class='inp' name='auteur' placeholder='Auteur...'>"
+                + "</div>"
+                + "<textarea class='inp' name='corps' placeholder='Contenu du document...'></textarea>"
+                + "<button class='btn-gen' type='submit'>Générer le PDF</button>"
+                + "</form></div>"
+
+                + "<div class='activity'><h2>Guide rapide</h2>"
+                + actItem("#EDE9FE","#5B21B6","TXT","Extraire texte","Uploadez un PDF et obtenez le texte")
+                + actItem("#E0F2FE","#0369A1","IMG","Convertir","Choisissez 72/150/300 DPI selon besoin")
+                + actItem("#D1FAE5","#065F46","FUS","Fusionner","Sélectionnez plusieurs PDFs à la fois")
+                + actItem("#CCFBF1","#0F766E","ZIP","Compresser","Réduisez le poids de votre fichier")
+                + actItem("#E0F2FE","#0C4A6E","QR","QR Code","Entrez x,y pour positionner le QR")
+                + actItem("#D1FAE5","#065F46","SIG","Signer","Entrez nom, raison et lieu de signature")
+                + "</div></div></div>"
+
+                + "<div class='footer'>Studio PDF CORBA – Java 8 × PDFBox 2.0</div>"
+
+                + modal("m-extract",  "Extraire le texte",     "Obtenez le contenu textuel",          "/extract",  uploadZone("fi-extract","doc",false))
+                + modal("m-image",    "Convertir en images",   "PDF vers PNG haute qualité",           "/image",
+                    uploadZone("fi-image","doc",false)
+                    + "<label>Résolution</label>"
+                    + "<select name='dpi'><option value='72'>72 DPI - Rapide</option><option value='150' selected>150 DPI - Standard</option><option value='300'>300 DPI - Haute qualité</option></select>")
+                + modal("m-protect",  "Protéger le PDF",       "Sécurisez avec un mot de passe",       "/protect",
+                    uploadZone("fi-protect","doc",false)
+                    + "<label>Mot de passe</label><input type='password' name='mdp' placeholder='Mot de passe...'>")
+                + modal("m-merge",    "Fusionner des PDFs",    "Combinez plusieurs fichiers",          "/merge",    uploadZone("fi-merge","docs",true))
+                + modal("m-split",    "Découper le PDF",       "Divisez en plusieurs parties",         "/split",
+                    uploadZone("fi-split","doc",false)
+                    + "<label>Pages par partie</label><input type='number' name='nb' value='1' min='1'>")
+                + modal("m-delete",   "Supprimer des pages",   "Retirez les pages indésirables",       "/delete",
+                    uploadZone("fi-delete","doc",false)
+                    + "<label>Pages à supprimer (ex: 1,3,5)</label><input type='text' name='pages' placeholder='1,2,3...'>")
+                + modal("m-pages",    "Extraire des pages",    "Sélectionnez les pages à conserver",   "/pages",
+                    uploadZone("fi-pages","doc",false)
+                    + "<label>Pages à extraire (ex: 1,3,5)</label><input type='text' name='pages' placeholder='1,2,3...'>")
+                + modal("m-compress", "Compresser le PDF",     "Réduire la taille du fichier",         "/compress", uploadZone("fi-compress","doc",false))
+                + modal("m-meta",     "Lire les métadonnées",  "Afficher les informations du doc",     "/meta",     uploadZone("fi-meta","doc",false))
+                + modal("m-metamod",  "Modifier métadonnées",  "Titre, auteur et sujet",               "/metamod",
+                    uploadZone("fi-metamod","doc",false)
+                    + "<label>Titre</label><input type='text' name='titre' placeholder='Nouveau titre...'>"
+                    + "<label>Auteur</label><input type='text' name='auteur' placeholder='Auteur...'>"
+                    + "<label>Sujet</label><input type='text' name='sujet' placeholder='Sujet...'>")
+                + modal("m-qrcode",   "Ajouter un QR Code",   "Insérez un QR code dans le PDF",       "/qrcode",
+                    uploadZone("fi-qrcode","doc",false)
+                    + "<label>Contenu du QR Code</label><input type='text' name='contenu' placeholder='https://...'>"
+                    + "<label>Page (commence à 0)</label><input type='number' name='page' value='0' min='0'>"
+                    + "<label>Position X</label><input type='number' name='x' value='400' min='0'>"
+                    + "<label>Position Y</label><input type='number' name='y' value='50' min='0'>")
+                + modal("m-sign",     "Signature numérique",   "Signez votre PDF avec RSA",            "/sign",
+                    uploadZone("fi-sign","doc",false)
+                    + "<label>Nom du signataire</label><input type='text' name='nom' placeholder='Votre nom...'>"
+                    + "<label>Raison</label><input type='text' name='raison' placeholder='Ex: Approbation...'>"
+                    + "<label>Lieu</label><input type='text' name='lieu' placeholder='Ex: Dakar...'>")
+
+                + jsCommon() + "</body></html>";
+
+            sendHtml(t, html);
+        }
+
+        static String actItem(String bg, String color, String label, String title, String desc) {
+            return "<div class='ai'>"
+                + "<div class='ai-ico' style='background:" + bg + ";color:" + color + "'>" + label + "</div>"
+                + "<div class='ai-info'><b>" + title + "</b><small>" + desc + "</small></div>"
+                + "</div>";
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  CONSTRUCTION DU TABLEAU UTILISATEURS
+    // ══════════════════════════════════════════════════════════
+    static String buildUserRows() {
         Set<String> connected = new java.util.HashSet<>();
         for (String val : SESSIONS.values()) {
             if (val.contains(":")) connected.add(val.split(":", 2)[1]);
         }
         StringBuilder sb = new StringBuilder();
-        int totalUsers = 0;
-        
-        String selectSQL = "SELECT username, role FROM users ORDER BY role ASC, username ASC";
-        try (Connection conn = getDbConnection(); 
-             Statement stmt = conn.createStatement(); 
-             ResultSet rs = stmt.executeQuery(selectSQL)) {
-            
-            while (rs.next()) {
-                totalUsers++;
-                String uname = rs.getString("username");
-                String role  = rs.getString("role");
-                boolean isAdmin = "admin".equals(role);
-                boolean isConnected = connected.contains(uname);
-                
-                String roleCell = isAdmin
-                    ? "<span class='role-badge role-admin'>Administrateur</span>"
-                    : "<span class='role-badge role-user'>Utilisateur</span>";
-                String statusCell = isConnected
-                    ? "<span style='color:#059669;font-weight:600;font-size:12px'>&#9679; Connecté</span>"
-                    : "<span style='color:#9CA3AF;font-weight:500;font-size:12px'>&#9675; Hors ligne</span>";
-                
-                sb.append("<tr>")
-                  .append("<td><b>").append(escapeHtml(uname)).append("</b></td>")
-                  .append("<td>").append(roleCell).append("</td>")
-                  .append("<td>").append(statusCell).append("</td>")
-                  .append("</tr>");
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-            sb.append("<tr><td colspan='3' style='color:red;'>Erreur lors de la récupération des données.</td></tr>");
+        for (Map.Entry<String,String> entry : USERS.entrySet()) {
+            String uname = entry.getKey();
+            String role  = ROLES.getOrDefault(uname, "user");
+            boolean isAdmin = "admin".equals(role);
+            boolean isConnected = connected.contains(uname);
+            String roleCell = isAdmin
+                ? "<span class='role-badge role-admin'>Administrateur</span>"
+                : "<span class='role-badge role-user'>Utilisateur</span>";
+            String statusCell = isConnected
+                ? "<span style='color:#059669;font-weight:600;font-size:12px'>&#9679; Connecté</span>"
+                : "<span style='color:#9CA3AF;font-weight:500;font-size:12px'>&#9675; Hors ligne</span>";
+            sb.append("<tr>")
+              .append("<td><b>").append(escapeHtml(uname)).append("</b></td>")
+              .append("<td>").append(roleCell).append("</td>")
+              .append("<td>").append(statusCell).append("</td>")
+              .append("</tr>");
         }
-        countOut[0] = totalUsers;
         return sb.toString();
     }
 
@@ -486,9 +559,6 @@ public class PDFWebGateway {
         public void handle(HttpExchange t) throws IOException {
             if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
             if (!"admin".equals(getRole(t))) { redirect(t, "/"); return; }
-
-            int[] totalUsersArr = new int[]{0};
-            String rows = buildUserRows(totalUsersArr);
 
             String html = "<!DOCTYPE html><html lang='fr'><head>"
                 + "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -522,7 +592,6 @@ public class PDFWebGateway {
                 + "</div></div>"
 
                 + "<div class='main'>"
-
                 + "<div class='stat-row'>"
                 + "<div class='stat st1'><div class='stat-l'>PDFs créés</div><div class='stat-n'>" + nbCrees + "</div><div class='stat-s'>Session actuelle</div></div>"
                 + "<div class='stat st2'><div class='stat-l'>Extractions</div><div class='stat-n'>" + nbExtractions + "</div><div class='stat-s'>Session actuelle</div></div>"
@@ -532,11 +601,11 @@ public class PDFWebGateway {
 
                 + "<div class='section-card'>"
                 + "<h2>Gestion des utilisateurs</h2>"
-                + "<p class='sub'>" + totalUsersArr[0] + " compte(s) enregistré(s) &mdash; " + SESSIONS.size() + " session(s) active(s)</p>"
+                + "<p class='sub'>" + USERS.size() + " compte(s) enregistré(s) &mdash; " + SESSIONS.size() + " session(s) active(s)</p>"
                 + "<table class='admin-table'>"
                 + "<thead><tr><th>Nom d'utilisateur</th><th>Rôle</th><th>Statut</th></tr></thead>"
                 + "<tbody>"
-                + rows
+                + buildUserRows()
                 + "</tbody></table>"
                 + "</div>"
 
@@ -618,162 +687,9 @@ public class PDFWebGateway {
         }
     }
 
-    // ── OUTILS ET UTILS RESTANTS (IDENTIQUES) ──────────────────────────────────────────────────
-    static class UIHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            if ("admin".equals(getRole(t))) { redirect(t, "/admin"); return; }
-
-            String html = "<!DOCTYPE html><html lang='fr'><head>"
-                + "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Studio PDF – Espace Utilisateur</title>"
-                + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap' rel='stylesheet'>"
-                + CSS_BASE + "</head><body>"
-                + "<div class='topbar' style='background:linear-gradient(135deg,#065F46 0%,#047857 40%,#059669 70%,#10B981 100%)'>"
-                + "<div class='topbar-row'>"
-                + "<div><h1>📄 Mon espace PDF</h1><p>Traitez vos documents en toute simplicité</p></div>"
-                + navbarUser("home")
-                + "</div></div>"
-                + "<div class='main'>"
-                + "<div style='background:#fff;border-radius:16px;padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;gap:16px;border-left:4px solid #059669'>"
-                + "<div style='width:44px;height:44px;background:linear-gradient(135deg,#D1FAE5,#6EE7B7);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px'>👤</div>"
-                + "<div><p style='font-size:14px;font-weight:600;color:#1E1B4B'>Bienvenue dans votre espace utilisateur</p>"
-                + "<p style='font-size:12px;color:#9CA3AF'>Vous pouvez utiliser tous les outils PDF disponibles ci-dessous.</p></div>"
-                + "</div>"
-                + "<p class='sec-label'>Outils disponibles</p>"
-                + "<div class='tools'>"
-                + tc("linear-gradient(90deg,#7C3AED,#A78BFA)", "Extraire texte",   "Lisez le contenu texte",        "Analyse",       "background:#EDE9FE;color:#5B21B6", "m-extract")
-                + tc("linear-gradient(90deg,#0EA5E9,#7DD3FC)", "En images",        "PDF vers PNG haute qualité",    "Conversion",    "background:#E0F2FE;color:#0369A1", "m-image")
-                + tc("linear-gradient(90deg,#10B981,#6EE7B7)", "Protéger",         "Chiffrement mot de passe",      "Sécurité",      "background:#D1FAE5;color:#065F46", "m-protect")
-                + tc("linear-gradient(90deg,#F59E0B,#FCD34D)", "Fusionner",        "Combiner plusieurs PDFs",       "Assemblage",    "background:#FEF3C7;color:#92400E", "m-merge")
-                + tc("linear-gradient(90deg,#EC4899,#F9A8D4)", "Découper",         "Diviser en plusieurs parties",  "Édition",       "background:#FCE7F3;color:#9D174D", "m-split")
-                + tc("linear-gradient(90deg,#EF4444,#FCA5A5)", "Supprimer pages",  "Retirer des pages précises",    "Édition",       "background:#FEE2E2;color:#991B1B", "m-delete")
-                + tc("linear-gradient(90deg,#8B5CF6,#C4B5FD)", "Extraire pages",   "Sélectionner et exporter",     "Extraction",    "background:#EDE9FE;color:#5B21B6", "m-pages")
-                + tc("linear-gradient(90deg,#14B8A6,#99F6E4)", "Compresser",       "Réduire la taille du fichier", "Optimisation",  "background:#CCFBF1;color:#0F766E", "m-compress")
-                + tc("linear-gradient(90deg,#6366F1,#A5B4FC)", "Métadonnées",      "Lire infos du document",       "Info",          "background:#EEF2FF;color:#3730A3", "m-meta")
-                + tc("linear-gradient(90deg,#D946EF,#F0ABFC)", "Modifier meta",    "Titre auteur sujet",           "Édition",       "background:#FDF4FF;color:#86198F", "m-metamod")
-                + tc("linear-gradient(90deg,#0284C7,#7DD3FC)", "QR Code",          "Insérer un QR code",           "Enrichissement","background:#E0F2FE;color:#0C4A6E", "m-qrcode")
-                + tc("linear-gradient(90deg,#059669,#6EE7B7)", "Signer",           "Signature numérique RSA",      "Sécurité",      "background:#D1FAE5;color:#065F46", "m-sign")
-                + "</div>"
-                + "<div class='bottom'>"
-                + "<div class='create'><h2>Créer un PDF</h2>"
-                + "<p class='sub'>Générez instantanément via le serveur CORBA</p>"
-                + "<form action='/create' method='get'>"
-                + "<div class='inp-row'>"
-                + "<input class='inp' name='titre' placeholder='Titre...'>"
-                + "<input class='inp' name='auteur' placeholder='Auteur...'>"
-                + "</div>"
-                + "<textarea class='inp' name='corps' placeholder='Contenu du document...'></textarea>"
-                + "<button class='btn-gen' type='submit'>Générer le PDF</button>"
-                + "</form></div>"
-                + "<div class='activity'><h2>Guide rapide</h2>"
-                + actItem("#EDE9FE","#5B21B6","TXT","Extraire texte","Uploadez un PDF et obtenez le texte")
-                + actItem("#E0F2FE","#0369A1","IMG","Convertir","Choisissez 72/150/300 DPI selon besoin")
-                + actItem("#D1FAE5","#065F46","FUS","Fusionner","Sélectionnez plusieurs PDFs à la fois")
-                + actItem("#CCFBF1","#0F766E","ZIP","Compresser","Réduisez le poids de votre fichier")
-                + "</div></div></div>"
-                + "<div class='footer'>Studio PDF CORBA – Java 8 × PDFBox 2.0</div>"
-                + modal("m-extract",  "Extraire le texte",     "Obtenez le contenu textuel",          "/extract",  uploadZone("fi-extract","doc",false))
-                + modal("m-image",    "Convertir en images",   "PDF vers PNG haute qualité",           "/image",
-                    uploadZone("fi-image","doc",false)
-                    + "<label>Résolution</label>"
-                    + "<select name='dpi'><option value='72'>72 DPI</option><option value='150' selected>150 DPI</option><option value='300'>300 DPI</option></select>")
-                + modal("m-protect",  "Protéger le PDF",       "Sécurisez avec un mot de passe",       "/protect",
-                    uploadZone("fi-protect","doc",false)
-                    + "<label>Mot de passe</label><input type='password' name='mdp' placeholder='Mot de passe...'>")
-                + modal("m-merge",    "Fusionner des PDFs",    "Combinez plusieurs fichiers",          "/merge",    uploadZone("fi-merge","docs",true))
-                + modal("m-split",    "Découper le PDF",       "Divisez en plusieurs parties",         "/split",
-                    uploadZone("fi-split","doc",false)
-                    + "<label>Pages par partie</label><input type='number' name='nb' value='1' min='1'>")
-                + modal("m-delete",   "Supprimer des pages",   "Retirez les pages indésirables",       "/delete",
-                    uploadZone("fi-delete","doc",false)
-                    + "<label>Pages à supprimer (ex: 1,3,5)</label><input type='text' name='pages' placeholder='1,2,3...'>")
-                + modal("m-pages",    "Extraire des pages",    "Sélectionnez les pages à conserver",   "/pages",
-                    uploadZone("fi-pages","doc",false)
-                    + "<label>Pages à extraire (ex: 1,3,5)</label><input type='text' name='pages' placeholder='1,2,3...'>")
-                + modal("m-compress", "Compresser le PDF",     "Réduire la taille du fichier",         "/compress", uploadZone("fi-compress","doc",false))
-                + modal("m-meta",     "Lire les métadonnées",  "Afficher les informations du doc",     "/meta",     uploadZone("fi-meta","doc",false))
-                + modal("m-metamod",  "Modifier métadonnées",  "Titre, auteur et sujet",               "/metamod",
-                    uploadZone("fi-metamod","doc",false)
-                    + "<label>Titre</label><input type='text' name='titre' placeholder='Nouveau titre...'>"
-                    + "<label>Auteur</label><input type='text' name='auteur' placeholder='Auteur...'>"
-                    + "<label>Sujet</label><input type='text' name='sujet' placeholder='Sujet...'>")
-                + modal("m-qrcode",   "Ajouter un QR Code",   "Insérez un QR code dans le PDF",       "/qrcode",
-                    uploadZone("fi-qrcode","doc",false)
-                    + "<label>Contenu du QR Code</label><input type='text' name='contenu' placeholder='https://...'>"
-                    + "<label>Page (commence à 0)</label><input type='number' name='page' value='0' min='0'>"
-                    + "<label>Position X</label><input type='number' name='x' value='400' min='0'>"
-                    + "<label>Position Y</label><input type='number' name='y' value='50' min='0'>")
-                + modal("m-sign",     "Signature numérique",   "Signez votre PDF avec RSA",            "/sign",
-                    uploadZone("fi-sign","doc",false)
-                    + "<label>Nom du signataire</label><input type='text' name='nom' placeholder='Votre nom...'>"
-                    + "<label>Raison</label><input type='text' name='raison' placeholder='Ex: Approbation...'>"
-                    + "<label>Lieu</label><input type='text' name='lieu' placeholder='Ex: Dakar...'>")
-                + jsCommon() + "</body></html>";
-
-            sendHtml(t, html);
-        }
-
-        static String actItem(String bg, String color, String label, String title, String desc) {
-            return "<div class='ai'>"
-                + "<div class='ai-ico' style='background:" + bg + ";color:" + color + "'>" + label + "</div>"
-                + "<div class='ai-info'><b>" + title + "</b><small>" + desc + "</small></div>"
-                + "</div>";
-        }
-    }
-
-    static String tc(String grad, String title, String desc, String tag, String tagStyle, String modalId) {
-        return "<div class='tc' onclick='openM(\"" + modalId + "\")'>"
-            + "<div class='tc-bar' style='background:" + grad + "'></div>"
-            + "<h3>" + title + "</h3><p>" + desc + "</p>"
-            + "<span class='tc-tag' style='" + tagStyle + "'>" + tag + "</span>"
-            + "</div>";
-    }
-
-    static String uploadZone(String id, String name, boolean multi) {
-        String mult = multi ? " multiple" : "";
-        return "<div class='upload-zone' onclick='document.getElementById(\"" + id + "\").click()'>"
-            + "<p>Choisir un PDF</p><small id='lbl-" + id + "'>Cliquer pour parcourir</small></div>"
-            + "<input type='file' id='" + id + "' name='" + name + "' accept='.pdf'" + mult
-            + " style='display:none' onchange='showName(\"lbl-" + id + "\",this)'>";
-    }
-
-    static String modal(String id, String title, String sub, String action, String content) {
-        return "<div class='overlay' id='" + id + "'><div class='modal'>"
-            + "<h2>" + title + "</h2><p class='msub'>" + sub + "</p>"
-            + "<form method='post' enctype='multipart/form-data' action='" + action + "'>"
-            + content
-            + "<div class='btn-row'>"
-            + "<button class='btn-cancel' type='button' onclick='closeM(\"" + id + "\")'>Annuler</button>"
-            + "<button class='btn-ok'>Confirmer</button>"
-            + "</div></form></div></div>";
-    }
-
-    static String navbarUser(String active) {
-        return "<div class='nav-links'>"
-            + "<span class='badge'><span class='dot'></span>&nbsp;Connecté</span>"
-            + (!"home".equals(active) ? "<a class='nav-link' href='/'>Accueil</a>" : "")
-            + "<a class='nav-link logout' href='/logout'>Déconnexion</a>"
-            + "</div>";
-    }
-
-    static String navbarAdmin(String active) {
-        return "<div class='nav-links'>"
-            + "<span class='badge'><span class='dot'></span>&nbsp;Admin</span>"
-            + "<a class='nav-link" + ("dash".equals(active) ? " active" : "") + "' href='/admin'>Tableau de bord</a>"
-            + "<a class='nav-link logout' href='/logout'>Déconnexion</a>"
-            + "</div>";
-    }
-
-    static String jsCommon() {
-        return "<script>"
-            + "function openM(id){document.getElementById(id).classList.add('active')}"
-            + "function closeM(id){document.getElementById(id).classList.remove('active')}"
-            + "function showName(id,input){document.getElementById(id).textContent=input.files.length>1?input.files.length+' fichiers':input.files[0]?.name||'Aucun'}"
-            + "document.querySelectorAll('.overlay').forEach(function(o){o.addEventListener('click',function(e){if(e.target===this)this.classList.remove('active')})})"
-            + "</script>";
-    }
-
+    // ══════════════════════════════════════════════════════════
+    //  HANDLERS MÉTIER
+    // ══════════════════════════════════════════════════════════
     static class GenerateHandler implements HttpHandler {
         public void handle(HttpExchange t) throws IOException {
             if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
@@ -970,6 +886,17 @@ public class PDFWebGateway {
         }
     }
 
+    // ══════════════════════════════════════════════════════════
+    //  UTILITAIRES AVEC SIGNATURES CORRIGÉES
+    // ══════════════════════════════════════════════════════════
+
+    static String statBox(String label, String val, String bg, String color) {
+        return "<div style='flex:1;background:" + bg + ";border-radius:10px;padding:14px;text-align:center'>"
+            + "<p style='font-size:10px;font-weight:600;color:" + color + ";text-transform:uppercase;letter-spacing:1px;margin-bottom:6px'>" + label + "</p>"
+            + "<p style='font-size:20px;font-weight:700;color:" + color + "'>" + val + "</p>"
+            + "</div>";
+    }
+
     static class MultipartData {
         Map<String,byte[]> files = new HashMap<>();
         Map<String,List<byte[]>> fileList = new HashMap<>();
@@ -1093,6 +1020,6 @@ public class PDFWebGateway {
 
     static String escapeHtml(String s) {
         if (s==null) return "";
-        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
+        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\"","&quot;").replace("'","&#x27;");
     }
 }

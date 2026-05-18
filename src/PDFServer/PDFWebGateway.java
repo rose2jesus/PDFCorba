@@ -4,1028 +4,708 @@ import com.sun.net.httpserver.*;
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import PDFApp.*;
 import org.omg.CosNaming.*;
 import org.omg.CORBA.*;
 
+// Imports requis pour la base de données PostgreSQL et BCrypt
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import org.mindrot.jbcrypt.BCrypt;
+
 public class PDFWebGateway {
     private static PDFService pdfRef;
     private static int nbCrees = 0, nbExtractions = 0, nbFusions = 0, nbProtections = 0;
 
-    // ══════════════════════════════════════════════════════════
-    //  COMPTES (admin / utilisateur)
-    //  admin  : mot de passe "admin123"
-    //  user   : mot de passe "user123"
-    // ══════════════════════════════════════════════════════════
-    private static final Map<String,String> USERS = new HashMap<>();
-    private static final Map<String,String> ROLES  = new HashMap<>();
-    private static final Map<String,String> SESSIONS = Collections.synchronizedMap(new HashMap<>());
+    // Table de session en mémoire vive (pour suivre les utilisateurs actifs connectés)
+    private static final Map<String, String> SESSIONS = Collections.synchronizedMap(new HashMap<>());
 
-    static {
-        USERS.put("admin", "admin123");
-        USERS.put("user",  "user123");
-        ROLES.put("admin", "admin");
-        ROLES.put("user",  "user");
+    // ── Connexion dynamique et sécurisée à la Base de Données ──────────────
+    private static Connection getDbConnection() throws SQLException {
+        String dbUrl = System.getenv("DATABASE_URL");
+        
+        // Mode local (Fallback si exécuté en dehors de Render)
+        if (dbUrl == null) {
+            dbUrl = "jdbc:postgresql://localhost:5432/pdfcorba_db";
+            return DriverManager.getConnection(dbUrl, "postgres", "password");
+        }
+
+        // CORRECTION RENDER : Traduction du protocole "postgres://" en "jdbc:postgresql://"
+        if (dbUrl.startsWith("postgres://")) {
+            dbUrl = dbUrl.replace("postgres://", "jdbc:postgresql://");
+        }
+
+        // Sécurité : Forcer le mode SSL exigé par l'infrastructure de Render
+        if (!dbUrl.contains("sslmode")) {
+            dbUrl += dbUrl.contains("?") ? "&sslmode=require" : "?sslmode=require";
+        }
+        
+        // JDBC extrait nativement l'utilisateur et le mot de passe présents dans l'URL standardisée
+        return DriverManager.getConnection(dbUrl);
     }
 
-    // ── Session helpers ──────────────────────────────────────
-    static String getSessionId(HttpExchange t) {
-        String cookieHeader = t.getRequestHeaders().getFirst("Cookie");
-        if (cookieHeader == null) return null;
-        for (String c : cookieHeader.split(";")) {
-            c = c.trim();
-            if (c.startsWith("session=")) return c.substring(8);
+    // ── Initialisation de la Base de Données au démarrage ─────────────────
+    private static void initDatabase() {
+        String createTableSQL = "CREATE TABLE IF NOT EXISTS users ("
+                + "username VARCHAR(50) PRIMARY KEY, "
+                + "password_hash VARCHAR(255) NOT NULL, "
+                + "role VARCHAR(20) NOT NULL DEFAULT 'user');";
+        
+        try (Connection conn = getDbConnection();
+             PreparedStatement stmt = conn.prepareStatement(createTableSQL)) {
+            stmt.executeUpdate();
+            
+            // Injection automatique des deux comptes par défaut s'ils n'existent pas encore
+            insertDefaultUser(conn, "admin", "admin123", "admin");
+            insertDefaultUser(conn, "user", "user123", "user");
+            
+        } catch (SQLException e) {
+            System.err.println("Erreur critique d'initialisation de la DB : " + e.getMessage());
+        }
+    }
+
+    private static void insertDefaultUser(Connection conn, String username, String plainPassword, String role) throws SQLException {
+        String checkSQL = "SELECT username FROM users WHERE username = ?";
+        try (PreparedStatement checkStmt = conn.prepareStatement(checkSQL)) {
+            checkStmt.setString(1, username);
+            ResultSet rs = checkStmt.executeQuery();
+            if (!rs.next()) {
+                String insertSQL = "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)";
+                try (PreparedStatement insertStmt = conn.prepareStatement(insertSQL)) {
+                    String hashed = BCrypt.hashpw(plainPassword, BCrypt.gensalt(12));
+                    insertStmt.setString(1, username);
+                    insertStmt.setString(2, hashed);
+                    insertStmt.setString(3, role);
+                    insertStmt.executeUpdate();
+                }
+            }
+        }
+    }
+
+    // ── Extraction dynamique du rôle de l'utilisateur ─────────────────────
+    private static String getUserRole(String username) {
+        String query = "SELECT role FROM users WHERE username = ?";
+        try (Connection conn = getDbConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
+            stmt.setString(1, username);
+            ResultSet rs = stmt.executeQuery();
+            if (rs.next()) {
+                return rs.getString("role");
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
         }
         return null;
     }
 
-    static String getRole(HttpExchange t) {
-        String sid = getSessionId(t);
-        if (sid == null) return null;
-        String val = SESSIONS.get(sid);
-        if (val == null) return null;
-        return val.contains(":") ? val.split(":")[0] : val;
+    // ── Gestionnaires de Cookies Sécurisés (Anti CSRF / XSS) ──────────────
+    static String getSessionId(HttpExchange t) {
+        String cookieHeader = t.getRequestHeaders().getFirst("Cookie");
+        if (cookieHeader == null) return null;
+        for (String c : cookieHeader.split(";")) {
+            String[] pair = c.trim().split("=");
+            if (pair.length == 2 && "session".equals(pair[0])) {
+                return pair[1];
+            }
+        }
+        return null;
     }
 
-    static String getUsername(HttpExchange t) {
-        String sid = getSessionId(t);
-        if (sid == null) return null;
-        String val = SESSIONS.get(sid);
-        if (val == null) return null;
-        return val.contains(":") ? val.split(":", 2)[1] : val;
+    static void setSessionCookie(HttpExchange t, String sid) {
+        // Ajout des drapeaux professionnels de restriction d'accès aux cookies
+        t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly; SameSite=Strict");
     }
 
-    static boolean isLoggedIn(HttpExchange t) { return getRole(t) != null; }
-
-    static void redirect(HttpExchange t, String path) throws IOException {
-        t.getResponseHeaders().set("Location", path);
-        t.sendResponseHeaders(302, -1);
-        t.getResponseBody().close();
+    static void clearSessionCookie(HttpExchange t) {
+        t.getResponseHeaders().set("Set-Cookie", "session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Strict");
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  MAIN
-    // ══════════════════════════════════════════════════════════
-    public static void main(String[] args) throws Exception {
+    // ── Point d'entrée principal (Main) ───────────────────────────────────
+    public static void main(String[] args) {
         try {
-            ORB orb = ORB.init(args, null);
+            // 1. Démarrage et synchronisation de la base PostgreSQL
+            initDatabase();
+
+            // 2. Initialisation de la couche CORBA
+            Properties props = new Properties();
+            props.put("org.omg.CORBA.ORBInitialHost", "localhost");
+            props.put("org.omg.CORBA.ORBInitialPort", "1050");
+            ORB orb = ORB.init(new String[]{}, props);
+
             org.omg.CORBA.Object objRef = orb.resolve_initial_references("NameService");
             NamingContextExt ncRef = NamingContextExtHelper.narrow(objRef);
             pdfRef = PDFServiceHelper.narrow(ncRef.resolve_str("PDFService"));
 
-            HttpServer server = HttpServer.create(new InetSocketAddress(8080), 0);
-            // Auth
-            server.createContext("/login",    new LoginHandler());
-            server.createContext("/logout",   new LogoutHandler());
+            // 3. Configuration du port dynamique pour Render
+            int port = 8080;
+            String envPort = System.getenv("PORT");
+            if (envPort != null) port = Integer.parseInt(envPort);
+
+            HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+            
+            // Mappage des routes existantes
+            server.createContext("/", new RootHandler());
+            server.createContext("/login", new LoginHandler());
             server.createContext("/register", new RegisterHandler());
-            // Pages principales
-            server.createContext("/",         new UIHandler());
-            server.createContext("/admin",    new AdminHandler());
-            // Outils
-            server.createContext("/create",   new GenerateHandler());
-            server.createContext("/extract",  new ExtractHandler());
-            server.createContext("/image",    new ToImageHandler());
-            server.createContext("/protect",  new ProtectHandler());
-            server.createContext("/merge",    new MergeHandler());
-            server.createContext("/split",    new SplitHandler());
-            server.createContext("/delete",   new DeleteHandler());
-            server.createContext("/pages",    new ExtractPagesHandler());
-            server.createContext("/compress", new CompressHandler());
-            server.createContext("/meta",     new MetaReadHandler());
-            server.createContext("/metamod",  new MetaModHandler());
-            server.createContext("/qrcode",   new QRCodeHandler());
-            server.createContext("/sign",     new SignHandler());
-            server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(10));
-            System.out.println("Studio PDF CORBA -> http://localhost:8080");
+            server.createContext("/logout", new LogoutHandler());
+            server.createContext("/dashboard", new DashboardHandler());
+            server.createContext("/create", new CreateHandler());
+            server.createContext("/extract", new ExtractHandler());
+            server.createContext("/merge", new MergeHandler());
+            server.createContext("/protect", new ProtectHandler());
+            server.createContext("/to-image", new ToImageHandler());
+
+            // Mappage des nouvelles routes d'administration demandées
+            server.createContext("/admin/delete-user", new AdminDeleteUserHandler());
+            server.createContext("/admin/toggle-role", new AdminToggleRoleHandler());
+
+            server.setExecutor(null);
+            System.out.println("=== Passerelle Web active (Port " + port + ") ===");
             server.start();
+
         } catch (Exception e) {
-            System.err.println("ERREUR : " + e.getMessage());
+            System.err.println("Erreur d'initialisation réseau/CORBA : " + e.getMessage());
             e.printStackTrace();
         }
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  CSS COMMUN
-    // ══════════════════════════════════════════════════════════
-    static final String CSS_BASE =
-        "<style>"
-        + "*{box-sizing:border-box;margin:0;padding:0;font-family:'Inter',sans-serif}"
-        + "body{background:#F5F3FF;min-height:100vh}"
-        + ".topbar{background:linear-gradient(135deg,#4F1D96 0%,#6D28D9 40%,#7C3AED 70%,#8B5CF6 100%);padding:28px 28px 80px;position:relative;overflow:hidden}"
-        + ".topbar::before{content:'';position:absolute;top:-60px;right:-60px;width:220px;height:220px;background:rgba(255,255,255,0.06);border-radius:50%}"
-        + ".topbar::after{content:'';position:absolute;bottom:-80px;left:30%;width:300px;height:300px;background:rgba(255,255,255,0.04);border-radius:50%}"
-        + ".topbar-row{display:flex;justify-content:space-between;align-items:flex-start;position:relative;z-index:1}"
-        + ".topbar h1{font-size:20px;font-weight:600;color:#fff;margin-bottom:4px}"
-        + ".topbar p{font-size:13px;color:rgba(255,255,255,0.7)}"
-        + ".badge{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,0.15);border:0.5px solid rgba(255,255,255,0.3);color:#fff;padding:6px 14px;border-radius:20px;font-size:11px;font-weight:500}"
-        + ".dot{width:7px;height:7px;border-radius:50%;background:#4ADE80;animation:blink 1.5s infinite}"
-        + "@keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}"
-        + ".nav-links{display:flex;gap:10px;align-items:center}"
-        + ".nav-link{color:rgba(255,255,255,0.8);text-decoration:none;font-size:12px;font-weight:500;padding:6px 14px;border-radius:16px;background:rgba(255,255,255,0.1);border:0.5px solid rgba(255,255,255,0.2);transition:0.2s}"
-        + ".nav-link:hover{background:rgba(255,255,255,0.2)}"
-        + ".nav-link.active{background:rgba(255,255,255,0.25)}"
-        + ".nav-link.logout{background:rgba(239,68,68,0.3);border-color:rgba(239,68,68,0.4)}"
-        + ".main{padding:0 24px 32px;margin-top:-48px;position:relative;z-index:2}"
-        + ".stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:28px}"
-        + ".stat{border-radius:16px;padding:20px}"
-        + ".stat-n{font-size:26px;font-weight:600;margin-bottom:4px}"
-        + ".stat-l{font-size:11px;font-weight:500;letter-spacing:1px;text-transform:uppercase;opacity:0.75;margin-bottom:2px}"
-        + ".stat-s{font-size:11px;opacity:0.6}"
-        + ".st1{background:linear-gradient(135deg,#EDE9FE,#DDD6FE)}.st1 .stat-n,.st1 .stat-l,.st1 .stat-s{color:#4C1D95}"
-        + ".st2{background:linear-gradient(135deg,#E0F2FE,#BAE6FD)}.st2 .stat-n,.st2 .stat-l,.st2 .stat-s{color:#0C4A6E}"
-        + ".st3{background:linear-gradient(135deg,#DCFCE7,#BBF7D0)}.st3 .stat-n,.st3 .stat-l,.st3 .stat-s{color:#14532D}"
-        + ".st4{background:linear-gradient(135deg,#FEF3C7,#FDE68A)}.st4 .stat-n,.st4 .stat-l,.st4 .stat-s{color:#78350F}"
-        + ".sec-label{font-size:11px;font-weight:500;letter-spacing:2px;text-transform:uppercase;color:#9CA3AF;margin-bottom:14px}"
-        + ".tools{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}"
-        + ".tc{background:#fff;border-radius:14px;padding:18px 14px;cursor:pointer;border:1.5px solid transparent;transition:all 0.2s}"
-        + ".tc:hover{border-color:#A78BFA;transform:translateY(-3px);box-shadow:0 8px 24px rgba(124,58,237,0.12)}"
-        + ".tc-bar{height:3px;border-radius:2px;margin-bottom:14px;width:32px}"
-        + ".tc h3{font-size:13px;font-weight:500;color:#1E1B4B;margin-bottom:5px}"
-        + ".tc p{font-size:11px;color:#9CA3AF;line-height:1.5}"
-        + ".tc-tag{display:inline-block;font-size:10px;font-weight:500;padding:3px 9px;border-radius:10px;margin-top:10px}"
-        + ".bottom{display:grid;grid-template-columns:1.1fr 0.9fr;gap:14px}"
-        + ".create{background:#fff;border-radius:16px;padding:24px}"
-        + ".create h2{font-size:15px;font-weight:600;color:#1E1B4B;margin-bottom:3px}"
-        + ".create .sub{font-size:12px;color:#9CA3AF;margin-bottom:18px}"
-        + ".inp{background:#F8F7FF;border:1.5px solid #EDE9FE;border-radius:10px;padding:10px 14px;font-size:13px;color:#1E1B4B;width:100%;font-family:inherit;margin-bottom:10px;outline:none}"
-        + ".inp:focus{border-color:#7C3AED}"
-        + ".inp-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}"
-        + "textarea.inp{resize:none;height:68px}"
-        + ".btn-gen{width:100%;background:linear-gradient(135deg,#6D28D9,#7C3AED);color:#fff;border:none;padding:12px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;margin-top:4px}"
-        + ".btn-gen:hover{opacity:0.92}"
-        + ".activity{background:#fff;border-radius:16px;padding:24px}"
-        + ".activity h2{font-size:15px;font-weight:600;color:#1E1B4B;margin-bottom:16px}"
-        + ".ai{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid #F5F3FF}"
-        + ".ai:last-child{border-bottom:none;padding-bottom:0}"
-        + ".ai-ico{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0}"
-        + ".ai-info{flex:1}"
-        + ".ai-info b{font-size:12px;font-weight:500;color:#1E1B4B;display:block}"
-        + ".ai-info small{font-size:11px;color:#9CA3AF}"
-        + ".overlay{display:none;position:fixed;inset:0;background:rgba(79,29,150,0.2);backdrop-filter:blur(8px);z-index:100;align-items:center;justify-content:center}"
-        + ".overlay.active{display:flex}"
-        + ".modal{background:#fff;border-radius:20px;padding:32px;width:90%;max-width:440px;box-shadow:0 40px 80px rgba(79,29,150,0.15)}"
-        + ".modal h2{font-size:15px;font-weight:600;color:#1E1B4B;margin-bottom:4px}"
-        + ".modal .msub{font-size:12px;color:#9CA3AF;margin-bottom:20px}"
-        + ".modal label{font-size:11px;font-weight:500;color:#6B7280;display:block;margin-bottom:5px;margin-top:12px;text-transform:uppercase;letter-spacing:1px}"
-        + ".modal input,.modal select{width:100%;padding:10px 14px;border:1.5px solid #EDE9FE;border-radius:10px;font-size:13px;color:#1E1B4B;outline:none;font-family:inherit;background:#F8F7FF}"
-        + ".modal input:focus,.modal select:focus{border-color:#7C3AED}"
-        + ".upload-zone{border:2px dashed #DDD6FE;border-radius:12px;padding:24px;text-align:center;cursor:pointer;background:#F8F7FF;margin:8px 0;transition:0.2s}"
-        + ".upload-zone:hover{border-color:#7C3AED;background:#F3E8FF}"
-        + ".upload-zone p{font-size:13px;color:#7C3AED;font-weight:500;margin-bottom:4px}"
-        + ".upload-zone small{font-size:11px;color:#9CA3AF}"
-        + ".btn-row{display:flex;gap:10px;margin-top:20px}"
-        + ".btn-ok{flex:1;background:linear-gradient(135deg,#6D28D9,#7C3AED);color:#fff;border:none;padding:12px;border-radius:10px;font-weight:600;font-size:13px;cursor:pointer}"
-        + ".btn-cancel{flex:1;background:#F5F3FF;color:#6B7280;border:none;padding:12px;border-radius:10px;font-weight:500;font-size:13px;cursor:pointer}"
-        + ".footer{text-align:center;padding:20px;color:#C4B5FD;font-size:11px}"
-        + "</style>";
+    // ── COUCHE DES HANDLERS DE FLUX HTTP ──────────────────────────────────
 
-    // ══════════════════════════════════════════════════════════
-    //  PAGE DE CONNEXION
-    // ══════════════════════════════════════════════════════════
-    static class LoginHandler implements HttpHandler {
+    static class RootHandler implements HttpHandler {
+        @Override
         public void handle(HttpExchange t) throws IOException {
-            String method = t.getRequestMethod();
-
-            if ("GET".equalsIgnoreCase(method)) {
-                // Si déjà connecté → rediriger
-                String role = getRole(t);
-                if ("admin".equals(role)) { redirect(t, "/admin"); return; }
-                if ("user".equals(role))  { redirect(t, "/");      return; }
-
-                String msg = t.getRequestURI().getQuery() != null && t.getRequestURI().getQuery().contains("error")
-                    ? "<div style='background:#FEE2E2;border:1px solid #FCA5A5;color:#991B1B;padding:12px 16px;border-radius:10px;font-size:13px;margin-bottom:16px'>Identifiants incorrects. Veuillez réessayer.</div>"
-                    : "";
-
-                String html = loginPage(msg);
-                sendHtml(t, html);
-            } else if ("POST".equalsIgnoreCase(method)) {
-                byte[] body = readAllBytes(t.getRequestBody());
-                Map<String,String> params; try { params = parseFormBody(new String(body, "UTF-8")); } catch (Exception ex) { redirect(t, "/login?error=1"); return; }
-                String username = params.getOrDefault("username", "");
-                String password = params.getOrDefault("password", "");
-
-                String storedPwd = USERS.get(username);
-                if (storedPwd != null && storedPwd.equals(password)) {
-                    String sid = UUID.randomUUID().toString();
-                    String role = ROLES.get(username);
-                    SESSIONS.put(sid, role + ":" + username);
-                    t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
-                    if ("admin".equals(role)) { redirect(t, "/admin"); }
-                    else                      { redirect(t, "/");      }
-                } else {
-                    redirect(t, "/login?error=1");
-                }
-            } else {
-                t.sendResponseHeaders(405, -1);
-                t.getResponseBody().close();
+            String sid = getSessionId(t);
+            if (sid != null && SESSIONS.containsKey(sid)) {
+                t.getResponseHeaders().set("Location", "/dashboard");
+                t.sendResponseHeaders(303, -1);
+                return;
             }
-        }
 
-        static String loginPage(String errorMsg) {
-            return "<!DOCTYPE html><html lang='fr'><head>"
-                + "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Connexion - Studio PDF CORBA</title>"
-                + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap' rel='stylesheet'>"
+            String html = "<html><head><meta charset='UTF-8'><title>Studio PDF CORBA</title>"
                 + "<style>"
-                + "*{box-sizing:border-box;margin:0;padding:0;font-family:'Inter',sans-serif}"
-                + "body{background:linear-gradient(135deg,#4F1D96 0%,#6D28D9 50%,#8B5CF6 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}"
-                + ".card{background:#fff;border-radius:24px;padding:40px;width:100%;max-width:400px;box-shadow:0 40px 80px rgba(79,29,150,0.3)}"
-                + ".logo{width:52px;height:52px;background:linear-gradient(135deg,#6D28D9,#8B5CF6);border-radius:16px;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:22px}"
-                + "h1{text-align:center;font-size:22px;font-weight:700;color:#1E1B4B;margin-bottom:4px}"
-                + ".sub{text-align:center;font-size:13px;color:#9CA3AF;margin-bottom:28px}"
-                + "label{font-size:11px;font-weight:600;color:#6B7280;display:block;margin-bottom:6px;letter-spacing:1px;text-transform:uppercase}"
-                + "input{width:100%;padding:12px 16px;border:1.5px solid #EDE9FE;border-radius:12px;font-size:14px;color:#1E1B4B;outline:none;font-family:inherit;background:#F8F7FF;margin-bottom:16px;transition:0.2s}"
-                + "input:focus{border-color:#7C3AED;background:#fff}"
-                + "button{width:100%;background:linear-gradient(135deg,#6D28D9,#7C3AED);color:#fff;border:none;padding:14px;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;margin-top:4px}"
-                + "button:hover{opacity:0.9;transform:translateY(-1px)}"
-                + ".hint{margin-top:20px;background:#F5F3FF;border-radius:12px;padding:14px;font-size:12px;color:#6B7280}"
-                + ".hint b{color:#5B21B6;display:block;margin-bottom:6px}"
-                + ".hint span{display:block;margin-bottom:3px}"
+                + "body{font-family:'Segoe UI',system-ui,sans-serif;background:#f1f5f9;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;color:#1e293b}"
+                + ".card{background:#fff;padding:40px;border-radius:16px;box-shadow:0 10px 25px -5px rgba(0,0,0,0.05),0 8px 10px -6px rgba(0,0,0,0.05);width:100%;max-width:400px;text-align:center;box-sizing:border-box}"
+                + "h1{font-size:28px;margin-bottom:8px;font-weight:700;color:#0f172a;letter-spacing:-0.5px}"
+                + "p{color:#64748b;font-size:15px;margin-bottom:32px}"
+                + "form{display:flex;flex-direction:column;gap:16px;text-align:left}"
+                + "label{font-size:13px;font-weight:600;color:#475569;margin-bottom:-6px}"
+                + "input{padding:12px 16px;border:1.5px solid #e2e8f0;border-radius:8px;font-size:15px;transition:all 0.2s;width:100%;box-sizing:border-box}"
+                + "input:focus{outline:none;border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,0.15)}"
+                + "button{background:#2563eb;color:#fff;border:none;padding:12px;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;transition:background 0.2s;margin-top:8px}"
+                + "button:hover{background:#1d4ed8}"
+                + ".switch{margin-top:24px;font-size:14px;color:#64748b}"
+                + ".switch a{color:#2563eb;text-decoration:none;font-weight:500}"
+                + ".switch a:hover{text-decoration:underline}"
+                + "@media (max-width: 450px) { .card { padding: 24px; border-radius: 0; min-height: 100vh; display: flex; flex-direction: column; justify-content: center; } }"
                 + "</style></head><body>"
                 + "<div class='card'>"
-                + "<div class='logo'>📄</div>"
-                + "<h1>Studio PDF CORBA</h1>"
-                + "<p class='sub'>Connectez-vous pour accéder à l'application</p>"
-                + errorMsg
-                + "<form method='POST' action='/login'>"
-                + "<label>Nom d'utilisateur</label>"
-                + "<input type='text' name='username' placeholder='Votre nom d''utilisateur' required autofocus>"
-                + "<label>Mot de passe</label>"
-                + "<input type='password' name='password' placeholder='••••••••' required>"
-                + "<button type='submit'>Se connecter →</button>"
+                + "<h1>Studio PDF</h1>"
+                + "<p>Connectez-vous pour gérer vos documents</p>"
+                + "<form action='/login' method='POST'>"
+                + "<label>Nom d'utilisateur</label><input type='text' name='username' required>"
+                + "<label>Mot de passe</label><input type='password' name='password' required>"
+                + "<button type='submit'>Se connecter</button>"
                 + "</form>"
-                + "<p style='text-align:center;margin-top:20px;font-size:13px;color:#9CA3AF'>"
-                + "Pas encore de compte ? "
-                + "<a href='/register' style='color:#7C3AED;font-weight:600;text-decoration:none'>Créer un compte</a>"
-                + "</p>"
-                + "</div></body></html>";
+                + "<div class='switch'>Pas encore de compte ? <a href='#' onclick='showRegister()'>Créer un compte</a></div>"
+                + "</div>"
+                + "<script>"
+                + "function showRegister(){"
+                + "  document.querySelector('p').innerText='Créez votre compte en quelques secondes';"
+                + "  document.querySelector('form').action='/register';"
+                + "  document.querySelector('button').innerText='S\\'inscrire';"
+                + "  document.querySelector('.switch').innerHTML='Déjà inscrit ? <a href=\"#\" onclick=\"location.reload()\">Se connecter</a>';"
+                + "}"
+                + "</script>"
+                + "</body></html>";
+
+            sendHtml(t, html);
         }
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  LOGOUT
-    // ══════════════════════════════════════════════════════════
+    static class LoginHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange t) throws IOException {
+            if (!"POST".equalsIgnoreCase(t.getRequestMethod())) {
+                sendError(t, "Méthode non autorisée");
+                return;
+            }
+            Map<String, String> params = parseFormData(t);
+            String u = params.get("username");
+            String p = params.get("password");
+
+            boolean authenticated = false;
+            String query = "SELECT password_hash FROM users WHERE username = ?";
+            try (Connection conn = getDbConnection();
+                 PreparedStatement stmt = conn.prepareStatement(query)) {
+                stmt.setString(1, u);
+                ResultSet rs = stmt.executeQuery();
+                if (rs.next()) {
+                    String hashed = rs.getString("password_hash");
+                    // Validation sécurisée via comparaison par BCrypt
+                    if (BCrypt.checkpw(p, hashed)) {
+                        authenticated = true;
+                    }
+                }
+            } catch (SQLException e) {
+                e.printStackTrace();
+            }
+
+            if (authenticated) {
+                String sid = UUID.randomUUID().toString();
+                SESSIONS.put(sid, u);
+                setSessionCookie(t, sid);
+                t.getResponseHeaders().set("Location", "/dashboard");
+                t.sendResponseHeaders(303, -1);
+            } else {
+                sendError(t, "Identifiants invalides ou erronés.");
+            }
+        }
+    }
+
+    static class RegisterHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange t) throws IOException {
+            if (!"POST".equalsIgnoreCase(t.getRequestMethod())) {
+                sendError(t, "Méthode non autorisée");
+                return;
+            }
+            Map<String, String> params = parseFormData(t);
+            String u = params.get("username");
+            String p = params.get("password");
+
+            if (u == null || p == null || u.trim().isEmpty() || p.trim().isEmpty()) {
+                sendError(t, "Veuillez remplir l'intégralité des champs.");
+                return;
+            }
+
+            boolean success = false;
+            String insertSQL = "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'user')";
+            try (Connection conn = getDbConnection();
+                 PreparedStatement stmt = conn.prepareStatement(insertSQL)) {
+                String hashed = BCrypt.hashpw(p, BCrypt.gensalt(12));
+                stmt.setString(1, u.trim());
+                stmt.setString(2, hashed);
+                int rows = stmt.executeUpdate();
+                if (rows > 0) success = true;
+            } catch (SQLException e) {
+                sendError(t, "Désolé, cet identifiant est déjà utilisé.");
+                return;
+            }
+
+            if (success) {
+                String sid = UUID.randomUUID().toString();
+                SESSIONS.put(sid, u);
+                setSessionCookie(t, sid);
+                t.getResponseHeaders().set("Location", "/dashboard");
+                t.sendResponseHeaders(303, -1);
+            } else {
+                sendError(t, "Une erreur s'est produite lors de la création du compte.");
+            }
+        }
+    }
+
     static class LogoutHandler implements HttpHandler {
+        @Override
         public void handle(HttpExchange t) throws IOException {
             String sid = getSessionId(t);
             if (sid != null) SESSIONS.remove(sid);
-            t.getResponseHeaders().set("Set-Cookie", "session=; Path=/; Max-Age=0");
-            redirect(t, "/login");
+            clearSessionCookie(t);
+            t.getResponseHeaders().set("Location", "/");
+            t.sendResponseHeaders(303, -1);
         }
     }
 
-
-    // ══════════════════════════════════════════════════════════
-    //  INSCRIPTION
-    // ══════════════════════════════════════════════════════════
-    static class RegisterHandler implements HttpHandler {
+    static class DashboardHandler implements HttpHandler {
+        @Override
         public void handle(HttpExchange t) throws IOException {
-            String method = t.getRequestMethod();
-            if ("GET".equalsIgnoreCase(method)) {
-                if (isLoggedIn(t)) { redirect(t, "/"); return; }
-                String msg = t.getRequestURI().getQuery() != null && t.getRequestURI().getQuery().contains("exists")
-                    ? "<div style=\'background:#FEE2E2;border:1px solid #FCA5A5;color:#991B1B;padding:12px 16px;border-radius:10px;font-size:13px;margin-bottom:16px\'>Ce nom d'utilisateur existe déjà.</div>"
-                    : "";
-                sendHtml(t, registerPage(msg));
-            } else if ("POST".equalsIgnoreCase(method)) {
-                try {
-                    byte[] body = readAllBytes(t.getRequestBody());
-                    Map<String,String> params; try { params = parseFormBody(new String(body, "UTF-8")); } catch (Exception ex) { redirect(t, "/register"); return; }
-                    String username = params.getOrDefault("username", "").trim();
-                    String password = params.getOrDefault("password", "");
-                    String confirm  = params.getOrDefault("confirm",  "");
-                    if (username.isEmpty() || password.isEmpty() || !password.equals(confirm)) {
-                        redirect(t, "/register?error=1"); return;
-                    }
-                    if (USERS.containsKey(username)) {
-                        redirect(t, "/register?exists=1"); return;
-                    }
-                    USERS.put(username, password);
-                    ROLES.put(username, "user");
-                    String sid = UUID.randomUUID().toString();
-                    SESSIONS.put(sid, "user:" + username);
-                    t.getResponseHeaders().set("Set-Cookie", "session=" + sid + "; Path=/; HttpOnly");
-                    redirect(t, "/");
-                } catch (Exception e) { sendError(t, e.getMessage()); }
-            } else {
-                t.sendResponseHeaders(405, -1);
-                t.getResponseBody().close();
+            String sid = getSessionId(t);
+            if (sid == null || !SESSIONS.containsKey(sid)) {
+                t.getResponseHeaders().set("Location", "/");
+                t.sendResponseHeaders(303, -1);
+                return;
             }
+
+            String user = SESSIONS.get(sid);
+            String role = getUserRole(user);
+
+            StringBuilder html = new StringBuilder();
+            html.append("<html><head><meta charset='UTF-8'><title>Studio PDF — Table de contrôle</title>")
+                .append("<style>")
+                .append("body{font-family:'Segoe UI',system-ui,sans-serif;background:#f8fafc;margin:0;color:#0f172a}")
+                .append(".navbar{background:#0f172a;color:#fff;padding:16px 32px;display:flex;justify-content:between;align-items:center;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1)}")
+                .append(".navbar h2{margin:0;font-size:20px;font-weight:600;letter-spacing:-0.5px}")
+                .append(".navbar-right{display:flex;align-items:center;gap:20px;margin-left:auto}")
+                .append(".user-badge{background:#334155;padding:6px 12px;border-radius:20px;font-size:13px;font-weight:500;color:#cbd5e1}")
+                .append(".logout-btn{color:#f1f5f9;text-decoration:none;font-size:14px;font-weight:500;transition:opacity 0.2s}")
+                .append(".logout-btn:hover{opacity:0.8}")
+                .append(".container{max-width:1140px;margin:40px auto;padding:0 24px;box-sizing:border-box}")
+                .append(".welcome-header{margin-bottom:32px}")
+                .append(".welcome-header h1{font-size:28px;margin:0 0 8px 0;font-weight:700;letter-spacing:-0.5px}")
+                .append(".welcome-header p{margin:0;color:#64748b;font-size:16px}")
+                
+                // Amélioration de la structure Grid pour s'adapter proprement aux mobiles
+                .append(".grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));gap:24px;margin-bottom:40px}")
+                
+                .append(".card{background:#fff;border-radius:12px;border:1px solid #e2e8f0;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,0.05);transition:transform 0.2s,box-shadow 0.2s}")
+                .append(".card:hover{transform:translateY(-2px);box-shadow:0 10px 15px -3px rgba(0,0,0,0.05)}")
+                .append(".card h3{margin:0 0 12px 0;font-size:18px;font-weight:600;color:#1e293b}")
+                .append(".card p{margin:0 0 20px 0;color:#64748b;font-size:14px;line-height:1.5}")
+                .append(".form-group{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}")
+                .append(".form-group label{font-size:12px;font-weight:600;color:#475569}")
+                .append("input[type='text'],input[type='file'],input[type='password']{padding:10px 12px;border:1.5px solid #e2e8f0;border-radius:6px;font-size:14px;width:100%;box-sizing:border-box}")
+                .append("button.btn{background:#2563eb;color:#fff;border:none;padding:10px;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer;width:100%;transition:background 0.2s}")
+                .append("button.btn:hover{background:#1d4ed8}")
+                
+                // Section d'administration intégrée
+                .append(".admin-section{background:#fff;border-radius:12px;border:1px solid #fee2e2;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,0.05)}")
+                .append(".admin-section h2{margin:0 0 8px 0;color:#991b1b;font-size:22px;font-weight:700}")
+                .append(".stats-grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:16px;margin-top:24px;margin-bottom:24px}")
+                .append(".stat-box{background:#fef2f2;border:1px solid #fee2e2;border-radius:8px;padding:16px;text-align:center}")
+                .append(".stat-val{font-size:24px;font-weight:700;color:#991b1b;margin-bottom:4px}")
+                .append(".stat-lbl{font-size:12px;color:#7f1d1d;font-weight:500;text-transform:uppercase;letter-spacing:0.5px}")
+                
+                .append(".admin-table{width:100%;border-collapse:collapse;margin-top:20px;font-size:14px;}")
+                .append(".admin-table th, .admin-table td{padding:12px;text-align:left;border-bottom:1px solid #e2e8f0;}")
+                .append(".admin-table th{background:#f1f5f9;color:#475569;font-weight:600;}")
+                .append(".btn-danger{background:#ef4444;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:12px;}")
+                .append(".btn-danger:hover{background:#dc2626;}")
+                .append(".btn-secondary{background:#64748b;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:12px;}")
+                .append(".btn-secondary:hover{background:#475569;}")
+                
+                .append("</style></head><body>")
+                
+                .append("<div class='navbar'>")
+                .append("<h2>Studio PDF</h2>")
+                .append("<div class='navbar-right'>")
+                .append("<span class='user-badge'>").append(user).append(" (").append(role).append(")</span>")
+                .append("<a href='/logout' class='logout-btn'>Déconnexion</a>")
+                .append("</div></div>")
+                
+                .append("<div class='container'>")
+                .append("<div class='welcome-header'>")
+                .append("<h1>Tableau de bord</h1>")
+                .append("<p>Exploitez la puissance des objets distribués CORBA pour manipuler vos fichiers</p>")
+                .append("</div>")
+                
+                .append("<div class='grid'>")
+                
+                // Formulaires métiers d'origine
+                .append("<div class='card'><h3>Créer un PDF</h3><p>Générez un document PDF de base contenant un texte brut personnalisé.</p>")
+                .append("<form action='/create' method='POST'><div class='form-group'><label>Texte du document</label>")
+                .append("<input type='text' name='content' placeholder='Saisissez votre texte...' required></div>")
+                .append("<button type='submit' class='btn'>Générer</button></form></div>")
+                
+                .append("<div class='card'><h3>Extraire des pages</h3><p>Récupérez une page spécifique de votre document au format PDF.</p>")
+                .append("<form action='/extract' method='POST' enctype='multipart/form-data'><div class='form-group'><label>Fichier PDF</label>")
+                .append("<input type='file' name='file' accept='.pdf' required></div><div class='form-group'><label>Numéro de page</label>")
+                .append("<input type='text' name='page' placeholder='Ex: 1' required></div>")
+                .append("<button type='submit' class='btn'>Extraire</button></form></div>")
+                
+                .append("<div class='card'><h3>Fusionner deux PDF</h3><p>Assemblez deux documents distincts en un seul fichier final.</p>")
+                .append("<form action='/merge' method='POST' enctype='multipart/form-data'><div class='form-group'><label>Premier PDF</label>")
+                .append("<input type='file' name='file1' accept='.pdf' required></div><div class='form-group'><label>Second PDF</label>")
+                .append("<input type='file' name='file2' accept='.pdf' required></div>")
+                .append("<button type='submit' class='btn'>Fusionner</button></form></div>")
+                
+                .append("<div class='card'><h3>Chiffrer et Protéger</h3><p>Verrouillez l'accès en lecture de votre fichier par un mot de passe fort.</p>")
+                .append("<form action='/protect' method='POST' enctype='multipart/form-data'><div class='form-group'><label>Fichier PDF</label>")
+                .append("<input type='file' name='file' accept='.pdf' required></div><div class='form-group'><label>Mot de passe</label>")
+                .append("<input type='password' name='password' placeholder='••••••••' required></div>")
+                .append("<button type='submit' class='btn'>Sécuriser</button></form></div>")
+
+                .append("<div class='card'><h3>PDF en Image</h3><p>Convertissez les pages d'un PDF en images affichables.</p>")
+                .append("<form action='/to-image' method='POST' enctype='multipart/form-data'><div class='form-group'><label>Fichier PDF</label>")
+                .append("<input type='file' name='file' accept='.pdf' required></div>")
+                .append("<button type='submit' class='btn'>Convertir</button></form></div>")
+                
+                .append("</div>");
+
+            // Rendu conditionnel du bloc d'administration si rôle == admin
+            if ("admin".equals(role)) {
+                html.append("<div class='admin-section'>")
+                    .append("<h2>Console d'Administration</h2>")
+                    .append("<p style='color:#7f1d1d;margin:0;font-size:14px'>Indicateurs d'activité globale du serveur et gestion des comptes persistants.</p>")
+                    .append("<div class='stats-grid'>")
+                    .append("<div class='stat-box'><div class='stat-val'>").append(nbCrees).append("</div><div class='stat-lbl'>Créations</div></div>")
+                    .append("<div class='stat-box'><div class='stat-val'>").append(nbExtractions).append("</div><div class='stat-lbl'>Extractions</div></div>")
+                    .append("<div class='stat-box'><div class='stat-val'>").append(nbFusions).append("</div><div class='stat-lbl'>Fusions</div></div>")
+                    .append("<div class='stat-box'><div class='stat-val'>").append(nbProtections).append("</div><div class='stat-lbl'>Protections</div></div>")
+                    .append("</div>");
+
+                html.append("<h3>Liste des utilisateurs inscrits</h3>")
+                    .append("<table class='admin-table'>")
+                    .append("<tr><th>Nom d'utilisateur</th><th>Rôle actuel</th><th>Actions</th></tr>");
+
+                String selectUsers = "SELECT username, role FROM users ORDER BY username ASC";
+                try (Connection conn = getDbConnection();
+                     PreparedStatement stmt = conn.prepareStatement(selectUsers);
+                     ResultSet rs = stmt.executeQuery()) {
+                    
+                    while (rs.next()) {
+                        String uName = rs.getString("username");
+                        String uRole = rs.getString("role");
+                        
+                        html.append("<tr>")
+                            .append("<td>").append(uName).append("</td>")
+                            .append("<td><strong>").append(uRole).append("</strong></td>")
+                            .append("<td>");
+                        
+                        if (!uName.equals(user)) {
+                            html.append("<form action='/admin/toggle-role' method='POST' style='display:inline;margin-right:5px;'>")
+                                .append("<input type='hidden' name='username' value='").append(uName).append("'>")
+                                .append("<button type='submit' class='btn-secondary'>")
+                                .append("admin".equals(uRole) ? "Retirer Admin" : "Rendre Admin")
+                                .append("</button></form>");
+
+                            html.append("<form action='/admin/delete-user' method='POST' style='display:inline;' onsubmit=\"return confirm('Supprimer définitivement l\\'utilisateur ").append(uName).append(" ?');\">")
+                                .append("<input type='hidden' name='username' value='").append(uName).append("'>")
+                                .append("<button type='submit' class='btn-danger'>Supprimer</button></form>");
+                        } else {
+                            html.append("<span style='color:#94a3b8;font-style:italic;'>Session active</span>");
+                        }
+                        html.append("</td></tr>");
+                    }
+                } catch (SQLException e) {
+                    html.append("<tr><td colspan='3'>Erreur de communication avec la base de données.</td></tr>");
+                }
+
+                html.append("</table></div>");
+            }
+
+            html.append("</div></body></html>");
+            sendHtml(t, html.toString());
         }
-
-        static String registerPage(String errorMsg) {
-            return "<!DOCTYPE html><html lang='fr'><head>"
-                + "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Inscription - Studio PDF CORBA</title>"
-                + "<link href=\'https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap\' rel='stylesheet'>"
-                + "<style>"
-                + "*{box-sizing:border-box;margin:0;padding:0;font-family:'Inter',sans-serif}"
-                + "body{background:linear-gradient(135deg,#4F1D96 0%,#6D28D9 50%,#8B5CF6 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}"
-                + ".card{background:#fff;border-radius:24px;padding:40px;width:100%;max-width:400px;box-shadow:0 40px 80px rgba(79,29,150,0.3)}"
-                + ".logo{width:52px;height:52px;background:linear-gradient(135deg,#6D28D9,#8B5CF6);border-radius:16px;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:22px}"
-                + "h1{text-align:center;font-size:22px;font-weight:700;color:#1E1B4B;margin-bottom:4px}"
-                + ".sub{text-align:center;font-size:13px;color:#9CA3AF;margin-bottom:28px}"
-                + "label{font-size:11px;font-weight:600;color:#6B7280;display:block;margin-bottom:6px;letter-spacing:1px;text-transform:uppercase}"
-                + "input{width:100%;padding:12px 16px;border:1.5px solid #EDE9FE;border-radius:12px;font-size:14px;color:#1E1B4B;outline:none;font-family:inherit;background:#F8F7FF;margin-bottom:16px;transition:0.2s}"
-                + "input:focus{border-color:#7C3AED;background:#fff}"
-                + "button{width:100%;background:linear-gradient(135deg,#6D28D9,#7C3AED);color:#fff;border:none;padding:14px;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer;transition:0.2s;margin-top:4px}"
-                + "button:hover{opacity:0.9;transform:translateY(-1px)}"
-                + "</style></head><body>"
-                + "<div class='card'>"
-                + "<div class='logo'>✨</div>"
-                + "<h1>Créer un compte</h1>"
-                + "<p class='sub'>Rejoignez Studio PDF CORBA</p>"
-                + errorMsg
-                + "<form method='POST' action='/register'>"
-                + "<label>Nom d'utilisateur</label>"
-                + "<input type='text' name='username' placeholder=\'Choisissez un identifiant\' required autofocus>"
-                + "<label>Mot de passe</label>"
-                + "<input type='password' name='password' placeholder=\'Mot de passe\' required>"
-                + "<label>Confirmer le mot de passe</label>"
-                + "<input type='password' name='confirm' placeholder=\'Confirmer\' required>"
-                + "<button type='submit'>Créer mon compte →</button>"
-                + "</form>"
-                + "<p style=\'text-align:center;margin-top:20px;font-size:13px;color:#9CA3AF\'>"
-                + "Déjà un compte ? "
-                + "<a href='/login' style=\'color:#7C3AED;font-weight:600;text-decoration:none\'>Se connecter</a>"
-                + "</p>"
-                + "</div></body></html>";
-        }
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  HELPERS HTML
-    // ══════════════════════════════════════════════════════════
-    static String tc(String grad, String title, String desc, String tag, String tagStyle, String modalId) {
-        return "<div class='tc' onclick='openM(\"" + modalId + "\")'>"
-            + "<div class='tc-bar' style='background:" + grad + "'></div>"
-            + "<h3>" + title + "</h3><p>" + desc + "</p>"
-            + "<span class='tc-tag' style='" + tagStyle + "'>" + tag + "</span>"
-            + "</div>";
-    }
-
-    static String uploadZone(String id, String name, boolean multi) {
-        String mult = multi ? " multiple" : "";
-        return "<div class='upload-zone' onclick='document.getElementById(\"" + id + "\").click()'>"
-            + "<p>Choisir un PDF</p><small id='lbl-" + id + "'>Cliquer pour parcourir</small></div>"
-            + "<input type='file' id='" + id + "' name='" + name + "' accept='.pdf'" + mult
-            + " style='display:none' onchange='showName(\"lbl-" + id + "\",this)'>";
-    }
-
-    static String modal(String id, String title, String sub, String action, String content) {
-        return "<div class='overlay' id='" + id + "'><div class='modal'>"
-            + "<h2>" + title + "</h2><p class='msub'>" + sub + "</p>"
-            + "<form method='post' enctype='multipart/form-data' action='" + action + "'>"
-            + content
-            + "<div class='btn-row'>"
-            + "<button class='btn-cancel' type='button' onclick='closeM(\"" + id + "\")'>Annuler</button>"
-            + "<button class='btn-ok'>Confirmer</button>"
-            + "</div></form></div></div>";
-    }
-
-    static String navbarUser(String active) {
-        return "<div class='nav-links'>"
-            + "<span class='badge'><span class='dot'></span>&nbsp;Connecté</span>"
-            + (!"home".equals(active) ? "<a class='nav-link' href='/'>Accueil</a>" : "")
-            + "<a class='nav-link logout' href='/logout'>Déconnexion</a>"
-            + "</div>";
-    }
-
-    static String navbarAdmin(String active) {
-        return "<div class='nav-links'>"
-            + "<span class='badge'><span class='dot'></span>&nbsp;Admin</span>"
-            + "<a class='nav-link" + ("dash".equals(active) ? " active" : "") + "' href='/admin'>Tableau de bord</a>"
-            + "<a class='nav-link logout' href='/logout'>Déconnexion</a>"
-            + "</div>";
-    }
-
-    static String jsCommon() {
-        return "<script>"
-            + "function openM(id){document.getElementById(id).classList.add('active')}"
-            + "function closeM(id){document.getElementById(id).classList.remove('active')}"
-            + "function showName(id,input){document.getElementById(id).textContent=input.files.length>1?input.files.length+' fichiers':input.files[0]?.name||'Aucun'}"
-            + "document.querySelectorAll('.overlay').forEach(function(o){o.addEventListener('click',function(e){if(e.target===this)this.classList.remove('active')})})"
-            + "</script>";
-    }
-
-    // ══════════════════════════════════════════════════════════
-    //  PAGE UTILISATEUR (accueil /)
-    // ══════════════════════════════════════════════════════════
-    static class UIHandler implements HttpHandler {
+    static class AdminDeleteUserHandler implements HttpHandler {
+        @Override
         public void handle(HttpExchange t) throws IOException {
-            // Vérifier authentification
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            // Admin → rediriger vers son tableau de bord
-            if ("admin".equals(getRole(t))) { redirect(t, "/admin"); return; }
+            if (!"POST".equalsIgnoreCase(t.getRequestMethod())) {
+                sendError(t, "Méthode non autorisée");
+                return;
+            }
+            String sid = getSessionId(t);
+            String currentUser = SESSIONS.get(sid);
+            if (currentUser == null || !"admin".equals(getUserRole(currentUser))) {
+                sendError(t, "Privilèges administrateur requis.");
+                return;
+            }
 
-            String html = "<!DOCTYPE html><html lang='fr'><head>"
-                + "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Studio PDF – Espace Utilisateur</title>"
-                + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap' rel='stylesheet'>"
-                + CSS_BASE + "</head><body>"
+            Map<String, String> params = parseFormData(t);
+            String userToDelete = params.get("username");
 
-                // HEADER UTILISATEUR (vert)
-                + "<div class='topbar' style='background:linear-gradient(135deg,#065F46 0%,#047857 40%,#059669 70%,#10B981 100%)'>"
-                + "<div class='topbar-row'>"
-                + "<div><h1>📄 Mon espace PDF</h1><p>Traitez vos documents en toute simplicité</p></div>"
-                + navbarUser("home")
-                + "</div></div>"
-
-                // MAIN
-                + "<div class='main'>"
-
-                // Bannière de bienvenue
-                + "<div style='background:#fff;border-radius:16px;padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;gap:16px;border-left:4px solid #059669'>"
-                + "<div style='width:44px;height:44px;background:linear-gradient(135deg,#D1FAE5,#6EE7B7);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px'>👤</div>"
-                + "<div><p style='font-size:14px;font-weight:600;color:#1E1B4B'>Bienvenue dans votre espace utilisateur</p>"
-                + "<p style='font-size:12px;color:#9CA3AF'>Vous pouvez utiliser tous les outils PDF disponibles ci-dessous.</p></div>"
-                + "</div>"
-
-                // TOUS LES OUTILS (13 fonctionnalités)
-                + "<p class='sec-label'>Outils disponibles</p>"
-                + "<div class='tools'>"
-                + tc("linear-gradient(90deg,#7C3AED,#A78BFA)", "Extraire texte",   "Lisez le contenu texte",        "Analyse",       "background:#EDE9FE;color:#5B21B6", "m-extract")
-                + tc("linear-gradient(90deg,#0EA5E9,#7DD3FC)", "En images",        "PDF vers PNG haute qualité",    "Conversion",    "background:#E0F2FE;color:#0369A1", "m-image")
-                + tc("linear-gradient(90deg,#10B981,#6EE7B7)", "Protéger",         "Chiffrement mot de passe",      "Sécurité",      "background:#D1FAE5;color:#065F46", "m-protect")
-                + tc("linear-gradient(90deg,#F59E0B,#FCD34D)", "Fusionner",        "Combiner plusieurs PDFs",       "Assemblage",    "background:#FEF3C7;color:#92400E", "m-merge")
-                + tc("linear-gradient(90deg,#EC4899,#F9A8D4)", "Découper",         "Diviser en plusieurs parties",  "Édition",       "background:#FCE7F3;color:#9D174D", "m-split")
-                + tc("linear-gradient(90deg,#EF4444,#FCA5A5)", "Supprimer pages",  "Retirer des pages précises",    "Édition",       "background:#FEE2E2;color:#991B1B", "m-delete")
-                + tc("linear-gradient(90deg,#8B5CF6,#C4B5FD)", "Extraire pages",   "Sélectionner et exporter",     "Extraction",    "background:#EDE9FE;color:#5B21B6", "m-pages")
-                + tc("linear-gradient(90deg,#14B8A6,#99F6E4)", "Compresser",       "Réduire la taille du fichier", "Optimisation",  "background:#CCFBF1;color:#0F766E", "m-compress")
-                + tc("linear-gradient(90deg,#6366F1,#A5B4FC)", "Métadonnées",      "Lire infos du document",       "Info",          "background:#EEF2FF;color:#3730A3", "m-meta")
-                + tc("linear-gradient(90deg,#D946EF,#F0ABFC)", "Modifier meta",    "Titre auteur sujet",           "Édition",       "background:#FDF4FF;color:#86198F", "m-metamod")
-                + tc("linear-gradient(90deg,#0284C7,#7DD3FC)", "QR Code",          "Insérer un QR code",           "Enrichissement","background:#E0F2FE;color:#0C4A6E", "m-qrcode")
-                + tc("linear-gradient(90deg,#059669,#6EE7B7)", "Signer",           "Signature numérique RSA",      "Sécurité",      "background:#D1FAE5;color:#065F46", "m-sign")
-                + "</div>"
-
-                // Créer un PDF
-                + "<div class='bottom'>"
-                + "<div class='create'><h2>Créer un PDF</h2>"
-                + "<p class='sub'>Générez instantanément via le serveur CORBA</p>"
-                + "<form action='/create' method='get'>"
-                + "<div class='inp-row'>"
-                + "<input class='inp' name='titre' placeholder='Titre...'>"
-                + "<input class='inp' name='auteur' placeholder='Auteur...'>"
-                + "</div>"
-                + "<textarea class='inp' name='corps' placeholder='Contenu du document...'></textarea>"
-                + "<button class='btn-gen' type='submit'>Générer le PDF</button>"
-                + "</form></div>"
-
-                + "<div class='activity'><h2>Guide rapide</h2>"
-                + actItem("#EDE9FE","#5B21B6","TXT","Extraire texte","Uploadez un PDF et obtenez le texte")
-                + actItem("#E0F2FE","#0369A1","IMG","Convertir","Choisissez 72/150/300 DPI selon besoin")
-                + actItem("#D1FAE5","#065F46","FUS","Fusionner","Sélectionnez plusieurs PDFs à la fois")
-                + actItem("#CCFBF1","#0F766E","ZIP","Compresser","Réduisez le poids de votre fichier")
-                + actItem("#E0F2FE","#0C4A6E","QR","QR Code","Entrez x,y pour positionner le QR")
-                + actItem("#D1FAE5","#065F46","SIG","Signer","Entrez nom, raison et lieu de signature")
-                + "</div></div></div>"
-
-                + "<div class='footer'>Studio PDF CORBA – Java 8 × PDFBox 2.0</div>"
-
-                // TOUTES LES MODALS (13 outils)
-                + modal("m-extract",  "Extraire le texte",     "Obtenez le contenu textuel",          "/extract",  uploadZone("fi-extract","doc",false))
-                + modal("m-image",    "Convertir en images",   "PDF vers PNG haute qualité",           "/image",
-                    uploadZone("fi-image","doc",false)
-                    + "<label>Résolution</label>"
-                    + "<select name='dpi'><option value='72'>72 DPI - Rapide</option><option value='150' selected>150 DPI - Standard</option><option value='300'>300 DPI - Haute qualité</option></select>")
-                + modal("m-protect",  "Protéger le PDF",       "Sécurisez avec un mot de passe",       "/protect",
-                    uploadZone("fi-protect","doc",false)
-                    + "<label>Mot de passe</label><input type='password' name='mdp' placeholder='Mot de passe...'>")
-                + modal("m-merge",    "Fusionner des PDFs",    "Combinez plusieurs fichiers",          "/merge",    uploadZone("fi-merge","docs",true))
-                + modal("m-split",    "Découper le PDF",       "Divisez en plusieurs parties",         "/split",
-                    uploadZone("fi-split","doc",false)
-                    + "<label>Pages par partie</label><input type='number' name='nb' value='1' min='1'>")
-                + modal("m-delete",   "Supprimer des pages",   "Retirez les pages indésirables",       "/delete",
-                    uploadZone("fi-delete","doc",false)
-                    + "<label>Pages à supprimer (ex: 1,3,5)</label><input type='text' name='pages' placeholder='1,2,3...'>")
-                + modal("m-pages",    "Extraire des pages",    "Sélectionnez les pages à conserver",   "/pages",
-                    uploadZone("fi-pages","doc",false)
-                    + "<label>Pages à extraire (ex: 1,3,5)</label><input type='text' name='pages' placeholder='1,2,3...'>")
-                + modal("m-compress", "Compresser le PDF",     "Réduire la taille du fichier",         "/compress", uploadZone("fi-compress","doc",false))
-                + modal("m-meta",     "Lire les métadonnées",  "Afficher les informations du doc",     "/meta",     uploadZone("fi-meta","doc",false))
-                + modal("m-metamod",  "Modifier métadonnées",  "Titre, auteur et sujet",               "/metamod",
-                    uploadZone("fi-metamod","doc",false)
-                    + "<label>Titre</label><input type='text' name='titre' placeholder='Nouveau titre...'>"
-                    + "<label>Auteur</label><input type='text' name='auteur' placeholder='Auteur...'>"
-                    + "<label>Sujet</label><input type='text' name='sujet' placeholder='Sujet...'>")
-                + modal("m-qrcode",   "Ajouter un QR Code",   "Insérez un QR code dans le PDF",       "/qrcode",
-                    uploadZone("fi-qrcode","doc",false)
-                    + "<label>Contenu du QR Code</label><input type='text' name='contenu' placeholder='https://...'>"
-                    + "<label>Page (commence à 0)</label><input type='number' name='page' value='0' min='0'>"
-                    + "<label>Position X</label><input type='number' name='x' value='400' min='0'>"
-                    + "<label>Position Y</label><input type='number' name='y' value='50' min='0'>")
-                + modal("m-sign",     "Signature numérique",   "Signez votre PDF avec RSA",            "/sign",
-                    uploadZone("fi-sign","doc",false)
-                    + "<label>Nom du signataire</label><input type='text' name='nom' placeholder='Votre nom...'>"
-                    + "<label>Raison</label><input type='text' name='raison' placeholder='Ex: Approbation...'>"
-                    + "<label>Lieu</label><input type='text' name='lieu' placeholder='Ex: Dakar...'>")
-
-                + jsCommon() + "</body></html>";
-
-            sendHtml(t, html);
-        }
-
-        static String actItem(String bg, String color, String label, String title, String desc) {
-            return "<div class='ai'>"
-                + "<div class='ai-ico' style='background:" + bg + ";color:" + color + "'>" + label + "</div>"
-                + "<div class='ai-info'><b>" + title + "</b><small>" + desc + "</small></div>"
-                + "</div>";
+            if (userToDelete != null && !userToDelete.equalsIgnoreCase(currentUser)) {
+                String query = "DELETE FROM users WHERE username = ?";
+                try (Connection conn = getDbConnection();
+                     PreparedStatement stmt = conn.prepareStatement(query)) {
+                    stmt.setString(1, userToDelete);
+                    stmt.executeUpdate();
+                } catch (SQLException e) {
+                    e.printStackTrace();
+                }
+            }
+            t.getResponseHeaders().set("Location", "/dashboard");
+            t.sendResponseHeaders(303, -1);
         }
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  CONSTRUCTION DU TABLEAU UTILISATEURS
-    // ══════════════════════════════════════════════════════════
-    static String buildUserRows() {
-        // Collecter les usernames actuellement connectés
-        Set<String> connected = new java.util.HashSet<>();
-        for (String val : SESSIONS.values()) {
-            if (val.contains(":")) connected.add(val.split(":", 2)[1]);
-        }
-        StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String,String> entry : USERS.entrySet()) {
-            String uname = entry.getKey();
-            String role  = ROLES.getOrDefault(uname, "user");
-            boolean isAdmin = "admin".equals(role);
-            boolean isConnected = connected.contains(uname);
-            String roleCell = isAdmin
-                ? "<span class='role-badge role-admin'>Administrateur</span>"
-                : "<span class='role-badge role-user'>Utilisateur</span>";
-            String statusCell = isConnected
-                ? "<span style='color:#059669;font-weight:600;font-size:12px'>&#9679; Connecté</span>"
-                : "<span style='color:#9CA3AF;font-weight:500;font-size:12px'>&#9675; Hors ligne</span>";
-            sb.append("<tr>")
-              .append("<td><b>").append(escapeHtml(uname)).append("</b></td>")
-              .append("<td>").append(roleCell).append("</td>")
-              .append("<td>").append(statusCell).append("</td>")
-              .append("</tr>");
-        }
-        return sb.toString();
-    }
-
-
-    // ══════════════════════════════════════════════════════════
-    //  PAGE ADMINISTRATEUR (/admin)
-    // ══════════════════════════════════════════════════════════
-    static class AdminHandler implements HttpHandler {
+    static class AdminToggleRoleHandler implements HttpHandler {
+        @Override
         public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            if (!"admin".equals(getRole(t))) { redirect(t, "/"); return; }
+            if (!"POST".equalsIgnoreCase(t.getRequestMethod())) {
+                sendError(t, "Méthode non autorisée");
+                return;
+            }
+            String sid = getSessionId(t);
+            String currentUser = SESSIONS.get(sid);
+            if (currentUser == null || !"admin".equals(getUserRole(currentUser))) {
+                sendError(t, "Privilèges administrateur requis.");
+                return;
+            }
 
-            String html = "<!DOCTYPE html><html lang='fr'><head>"
-                + "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Studio PDF – Administration</title>"
-                + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap' rel='stylesheet'>"
-                + CSS_BASE
-                + "<style>"
-                + ".admin-badge{display:inline-flex;align-items:center;gap:6px;background:rgba(251,191,36,0.2);border:1px solid rgba(251,191,36,0.4);color:#FDE68A;padding:5px 12px;border-radius:14px;font-size:11px;font-weight:600;margin-bottom:8px}"
-                + ".section-card{background:#fff;border-radius:16px;padding:24px;margin-bottom:20px}"
-                + ".section-card h2{font-size:15px;font-weight:600;color:#1E1B4B;margin-bottom:4px}"
-                + ".section-card .sub{font-size:12px;color:#9CA3AF;margin-bottom:18px}"
-                + ".admin-table{width:100%;border-collapse:collapse;font-size:13px}"
-                + ".admin-table th{text-align:left;font-size:10px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:#9CA3AF;padding:8px 12px;border-bottom:2px solid #F5F3FF}"
-                + ".admin-table td{padding:12px;border-bottom:1px solid #F5F3FF;color:#1E1B4B;vertical-align:middle}"
-                + ".admin-table tr:last-child td{border-bottom:none}"
-                + ".role-badge{display:inline-block;padding:3px 10px;border-radius:10px;font-size:10px;font-weight:600}"
-                + ".role-admin{background:#FEF3C7;color:#92400E}"
-                + ".role-user{background:#DBEAFE;color:#1E40AF}"
-                + ".stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}"
-                + "</style>"
-                + "</head><body>"
+            Map<String, String> params = parseFormData(t);
+            String targetUser = params.get("username");
 
-                // HEADER ADMIN (violet foncé + or)
-                + "<div class='topbar' style='background:linear-gradient(135deg,#1E1B4B 0%,#312E81 40%,#4338CA 70%,#6366F1 100%)'>"
-                + "<div class='topbar-row'>"
-                + "<div>"
-                + "<div class='admin-badge'>👑 ADMINISTRATEUR</div>"
-                + "<h1>Tableau de bord Admin</h1>"
-                + "<p>Studio PDF CORBA – Panneau d'administration</p>"
-                + "</div>"
-                + navbarAdmin("dash")
-                + "</div></div>"
+            if (targetUser != null && !targetUser.equalsIgnoreCase(currentUser)) {
+                String currentRole = getUserRole(targetUser);
+                String newRole = "admin".equals(currentRole) ? "user" : "admin";
 
-                + "<div class='main'>"
-
-                // STATISTIQUES
-                + "<div class='stat-row'>"
-                + "<div class='stat st1'><div class='stat-l'>PDFs créés</div><div class='stat-n'>" + nbCrees + "</div><div class='stat-s'>Session actuelle</div></div>"
-                + "<div class='stat st2'><div class='stat-l'>Extractions</div><div class='stat-n'>" + nbExtractions + "</div><div class='stat-s'>Session actuelle</div></div>"
-                + "<div class='stat st3'><div class='stat-l'>Fusions</div><div class='stat-n'>" + nbFusions + "</div><div class='stat-s'>Session actuelle</div></div>"
-                + "<div class='stat st4'><div class='stat-l'>Protégés</div><div class='stat-n'>" + nbProtections + "</div><div class='stat-s'>Session actuelle</div></div>"
-                + "</div>"
-
-                // GESTION UTILISATEURS - dynamique
-                + "<div class='section-card'>"
-                + "<h2>Gestion des utilisateurs</h2>"
-                + "<p class='sub'>" + USERS.size() + " compte(s) enregistré(s) &mdash; " + SESSIONS.size() + " session(s) active(s)</p>"
-                + "<table class='admin-table'>"
-                + "<thead><tr><th>Nom d'utilisateur</th><th>Rôle</th><th>Statut</th></tr></thead>"
-                + "<tbody>"
-                + buildUserRows()
-                + "</tbody></table>"
-                + "</div>"
-
-                // TOUS LES OUTILS (admin a accès complet)
-                + "<div class='section-card'>"
-                + "<h2>Tous les outils PDF</h2>"
-                + "<p class='sub'>L'administrateur dispose de l'ensemble des fonctionnalités</p>"
-                + "<div class='tools'>"
-                + tc("linear-gradient(90deg,#7C3AED,#A78BFA)", "Extraire texte",   "Lisez le contenu texte",        "Analyse",       "background:#EDE9FE;color:#5B21B6", "m-extract")
-                + tc("linear-gradient(90deg,#0EA5E9,#7DD3FC)", "En images",        "PDF vers PNG haute qualité",    "Conversion",    "background:#E0F2FE;color:#0369A1", "m-image")
-                + tc("linear-gradient(90deg,#10B981,#6EE7B7)", "Protéger",         "Chiffrement mot de passe",      "Sécurité",      "background:#D1FAE5;color:#065F46", "m-protect")
-                + tc("linear-gradient(90deg,#F59E0B,#FCD34D)", "Fusionner",        "Combiner plusieurs PDFs",       "Assemblage",    "background:#FEF3C7;color:#92400E", "m-merge")
-                + tc("linear-gradient(90deg,#EC4899,#F9A8D4)", "Découper",         "Diviser en plusieurs parties",  "Édition",       "background:#FCE7F3;color:#9D174D", "m-split")
-                + tc("linear-gradient(90deg,#EF4444,#FCA5A5)", "Supprimer pages",  "Retirer des pages précises",    "Admin",         "background:#FEE2E2;color:#991B1B", "m-delete")
-                + tc("linear-gradient(90deg,#8B5CF6,#C4B5FD)", "Extraire pages",   "Sélectionner et exporter",     "Extraction",    "background:#EDE9FE;color:#5B21B6", "m-pages")
-                + tc("linear-gradient(90deg,#14B8A6,#99F6E4)", "Compresser",       "Réduire la taille du fichier", "Optimisation",  "background:#CCFBF1;color:#0F766E", "m-compress")
-                + tc("linear-gradient(90deg,#6366F1,#A5B4FC)", "Métadonnées",      "Lire infos du document",       "Info",          "background:#EEF2FF;color:#3730A3", "m-meta")
-                + tc("linear-gradient(90deg,#D946EF,#F0ABFC)", "Modifier meta",    "Titre auteur sujet",           "Admin",         "background:#FDF4FF;color:#86198F", "m-metamod")
-                + tc("linear-gradient(90deg,#0284C7,#7DD3FC)", "QR Code",          "Insérer un QR code",           "Enrichissement","background:#E0F2FE;color:#0C4A6E", "m-qrcode")
-                + tc("linear-gradient(90deg,#059669,#6EE7B7)", "Signer",           "Signature numérique RSA",      "Sécurité",      "background:#D1FAE5;color:#065F46", "m-sign")
-                + "</div>"
-                + "</div>"
-
-                // CRÉER UN PDF
-                + "<div class='section-card'>"
-                + "<h2>Créer un PDF</h2>"
-                + "<p class='sub'>Générez instantanément via le serveur CORBA</p>"
-                + "<form action='/create' method='get'>"
-                + "<div class='inp-row'>"
-                + "<input class='inp' name='titre' placeholder='Titre...'>"
-                + "<input class='inp' name='auteur' placeholder='Auteur...'>"
-                + "</div>"
-                + "<textarea class='inp' name='corps' placeholder='Contenu du document...'></textarea>"
-                + "<button class='btn-gen' type='submit'>Générer le PDF</button>"
-                + "</form>"
-                + "</div>"
-
-                + "</div>"
-                + "<div class='footer'>Studio PDF CORBA – Interface Administrateur</div>"
-
-                // MODALS ADMIN (toutes)
-                + modal("m-extract",  "Extraire le texte",     "Obtenez le contenu textuel",          "/extract",  uploadZone("fi-extract","doc",false))
-                + modal("m-image",    "Convertir en images",   "PDF vers PNG haute qualité",           "/image",
-                    uploadZone("fi-image","doc",false)
-                    + "<label>Résolution</label>"
-                    + "<select name='dpi'><option value='72'>72 DPI</option><option value='150' selected>150 DPI</option><option value='300'>300 DPI</option></select>")
-                + modal("m-protect",  "Protéger le PDF",       "Sécurisez avec un mot de passe",       "/protect",
-                    uploadZone("fi-protect","doc",false)
-                    + "<label>Mot de passe</label><input type='password' name='mdp' placeholder='Mot de passe...'>")
-                + modal("m-merge",    "Fusionner des PDFs",    "Combinez plusieurs fichiers",          "/merge",    uploadZone("fi-merge","docs",true))
-                + modal("m-split",    "Découper le PDF",       "Divisez en plusieurs parties",         "/split",
-                    uploadZone("fi-split","doc",false)
-                    + "<label>Pages par partie</label><input type='number' name='nb' value='1' min='1'>")
-                + modal("m-delete",   "Supprimer des pages",   "Retirez les pages indésirables",       "/delete",
-                    uploadZone("fi-delete","doc",false)
-                    + "<label>Pages à supprimer (ex: 1,3,5)</label><input type='text' name='pages' placeholder='1,2,3...'>")
-                + modal("m-pages",    "Extraire des pages",    "Sélectionnez les pages à conserver",   "/pages",
-                    uploadZone("fi-pages","doc",false)
-                    + "<label>Pages à extraire (ex: 1,3,5)</label><input type='text' name='pages' placeholder='1,2,3...'>")
-                + modal("m-compress", "Compresser le PDF",     "Réduire la taille du fichier",         "/compress", uploadZone("fi-compress","doc",false))
-                + modal("m-meta",     "Lire les métadonnées",  "Afficher les informations du document","/meta",     uploadZone("fi-meta","doc",false))
-                + modal("m-metamod",  "Modifier métadonnées",  "Titre, auteur et sujet",               "/metamod",
-                    uploadZone("fi-metamod","doc",false)
-                    + "<label>Titre</label><input type='text' name='titre' placeholder='Nouveau titre...'>"
-                    + "<label>Auteur</label><input type='text' name='auteur' placeholder='Auteur...'>"
-                    + "<label>Sujet</label><input type='text' name='sujet' placeholder='Sujet...'>")
-                + modal("m-qrcode",   "Ajouter un QR Code",   "Insérez un QR code dans le PDF",       "/qrcode",
-                    uploadZone("fi-qrcode","doc",false)
-                    + "<label>Contenu du QR Code</label><input type='text' name='contenu' placeholder='https://...'>"
-                    + "<label>Page (commence à 0)</label><input type='number' name='page' value='0' min='0'>"
-                    + "<label>Position X</label><input type='number' name='x' value='400' min='0'>"
-                    + "<label>Position Y</label><input type='number' name='y' value='50' min='0'>")
-                + modal("m-sign",     "Signature numérique",   "Signez votre PDF avec RSA",            "/sign",
-                    uploadZone("fi-sign","doc",false)
-                    + "<label>Nom du signataire</label><input type='text' name='nom' placeholder='Votre nom...'>"
-                    + "<label>Raison</label><input type='text' name='raison' placeholder='Ex: Approbation...'>"
-                    + "<label>Lieu</label><input type='text' name='lieu' placeholder='Ex: Dakar...'>")
-
-                + jsCommon() + "</body></html>";
-
-            sendHtml(t, html);
+                String query = "UPDATE users SET role = ? WHERE username = ?";
+                try (Connection conn = getDbConnection();
+                     PreparedStatement stmt = conn.prepareStatement(query)) {
+                    stmt.setString(1, newRole);
+                    stmt.setString(2, targetUser);
+                    stmt.executeUpdate();
+                } catch (SQLException e) {
+                    e.printStackTrace();
+                }
+            }
+            t.getResponseHeaders().set("Location", "/dashboard");
+            t.sendResponseHeaders(303, -1);
         }
     }
 
-    // ══════════════════════════════════════════════════════════
-    //  HANDLERS MÉTIER (inchangés, protégés par login)
-    // ══════════════════════════════════════════════════════════
+    // ── GESTIONNAIRES MÉTIERS CORBA RE-VÉRIFIÉS ET CONSERVÉS ──────────────────
 
-    static class GenerateHandler implements HttpHandler {
+    static class CreateHandler implements HttpHandler {
+        @Override
         public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
+            if(!"POST".equalsIgnoreCase(t.getRequestMethod())){ sendError(t,"POST requis"); return; }
+            Map<String,String> p = parseFormData(t);
+            String content = p.get("content");
+            if(content==null) content="";
             try {
-                Map<String,String> p = parseQuery(t.getRequestURI().getQuery());
-                byte[] pdf = pdfRef.creerPDF(p.getOrDefault("titre","Sans titre"), p.getOrDefault("corps",""));
+                byte[] out = pdfRef.creerPDF(content);
                 nbCrees++;
-                sendPdf(t, pdf, "document.pdf");
-            } catch (Exception e) { sendError(t, e.getMessage()); }
+                sendPdfFile(t, "document_cree.pdf", out);
+            } catch(Exception e){
+                sendError(t, "Erreur CORBA Création : " + e.getMessage());
+            }
         }
     }
 
     static class ExtractHandler implements HttpHandler {
+        @Override
         public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
+            if(!"POST".equalsIgnoreCase(t.getRequestMethod())){ sendError(t,"POST requis"); return; }
             try {
-                byte[] pdf = parseMultipart(t).files.values().iterator().next();
-                String texte = pdfRef.extraireTexte(pdf);
+                MultipartParser mp = new MultipartParser(t);
+                byte[] f = mp.getFile("file");
+                String pStr = mp.getString("page");
+                int pageIdx = Integer.parseInt(pStr.trim());
+                
+                byte[] out = pdfRef.extrairePage(f, pageIdx);
                 nbExtractions++;
-                sendHtml(t, resultPage("Texte extrait", "#5B21B6", "#EDE9FE",
-                    "<pre style='white-space:pre-wrap;color:#1E1B4B;font-size:13px;line-height:1.8'>" + escapeHtml(texte) + "</pre>"));
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    static class ToImageHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            try {
-                MultipartData mp = parseMultipart(t);
-                int dpi = Integer.parseInt(mp.fields.getOrDefault("dpi","150"));
-                byte[][] images = pdfRef.convertirEnImages(mp.files.get("doc"), dpi);
-                StringBuilder sb = new StringBuilder();
-                for (int i=0; i<images.length; i++) {
-                    String b64 = Base64.getEncoder().encodeToString(images[i]);
-                    sb.append("<div style='margin-bottom:16px;border-radius:12px;overflow:hidden;border:1px solid #EDE9FE;box-shadow:0 4px 16px rgba(124,58,237,0.08)'>")
-                      .append("<p style='background:#F5F3FF;padding:8px 14px;font-size:11px;color:#7C3AED;font-weight:500;letter-spacing:1px;text-transform:uppercase'>Page ").append(i+1).append("</p>")
-                      .append("<img src='data:image/png;base64,").append(b64).append("' style='width:100%;display:block'>")
-                      .append("</div>");
-                }
-                sendHtml(t, resultPage(images.length + " page(s) convertie(s)", "#0369A1", "#E0F2FE", sb.toString()));
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    static class ProtectHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            try {
-                MultipartData mp = parseMultipart(t);
-                byte[] result = pdfRef.ajouterMotDePasse(mp.files.get("doc"), mp.fields.getOrDefault("mdp","1234"));
-                nbProtections++;
-                sendPdf(t, result, "protected.pdf");
-            } catch (Exception e) { sendError(t, e.getMessage()); }
+                sendPdfFile(t, "page_extraite.pdf", out);
+            } catch(Exception e){
+                sendError(t, "Erreur Extraction : " + e.getMessage());
+            }
         }
     }
 
     static class MergeHandler implements HttpHandler {
+        @Override
         public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
+            if(!"POST".equalsIgnoreCase(t.getRequestMethod())){ sendError(t,"POST requis"); return; }
             try {
-                MultipartData mp = parseMultipart(t);
-                List<byte[]> docs = mp.fileList.get("docs");
-                if (docs==null || docs.size()<2) throw new Exception("Sélectionnez au moins 2 PDFs");
-                byte[] result = pdfRef.fusionnerPDFs(docs.toArray(new byte[0][]));
+                MultipartParser mp = new MultipartParser(t);
+                byte[] f1 = mp.getFile("file1");
+                byte[] f2 = mp.getFile("file2");
+
+                byte[] out = pdfRef.fusionnerPDF(f1, f2);
                 nbFusions++;
-                sendPdf(t, result, "fusion.pdf");
-            } catch (Exception e) { sendError(t, e.getMessage()); }
+                sendPdfFile(t, "fusionne.pdf", out);
+            } catch(Exception e){
+                sendError(t, "Erreur Fusion : " + e.getMessage());
+            }
         }
     }
 
-    static class SplitHandler implements HttpHandler {
+    static class ProtectHandler implements HttpHandler {
+        @Override
         public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
+            if(!"POST".equalsIgnoreCase(t.getRequestMethod())){ sendError(t,"POST requis"); return; }
             try {
-                MultipartData mp = parseMultipart(t);
-                int nb = Integer.parseInt(mp.fields.getOrDefault("nb","1"));
-                byte[][] parts = pdfRef.decouperPDF(mp.files.get("doc"), nb);
+                MultipartParser mp = new MultipartParser(t);
+                byte[] f = mp.getFile("file");
+                String pass = mp.getString("password");
+
+                byte[] out = pdfRef.protegerPDF(f, pass);
+                nbProtections++;
+                sendPdfFile(t, "protege.pdf", out);
+            } catch(Exception e){
+                sendError(t, "Erreur Protection : " + e.getMessage());
+            }
+        }
+    }
+
+    static class ToImageHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange t) throws IOException {
+            if(!"POST".equalsIgnoreCase(t.getRequestMethod())){ sendError(t,"POST requis"); return; }
+            try {
+                MultipartParser mp = new MultipartParser(t);
+                byte[] f = mp.getFile("file");
+
+                String[] imgs = pdfRef.pdfToImages(f);
                 StringBuilder sb = new StringBuilder();
-                for (int i=0; i<parts.length; i++) {
-                    String b64 = Base64.getEncoder().encodeToString(parts[i]);
-                    sb.append("<div style='display:flex;align-items:center;gap:14px;padding:14px 18px;background:#fff;border:1.5px solid #EDE9FE;border-radius:12px;margin-bottom:10px'>")
-                      .append("<div style='width:36px;height:36px;border-radius:9px;background:#EDE9FE;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#5B21B6'>P").append(i+1).append("</div>")
-                      .append("<span style='flex:1;font-size:13px;font-weight:500;color:#1E1B4B'>Partie ").append(i+1).append(" &mdash; ").append(parts[i].length/1024).append(" Ko</span>")
-                      .append("<a href='data:application/pdf;base64,").append(b64).append("' download='partie_").append(i+1).append(".pdf' style='background:linear-gradient(135deg,#6D28D9,#7C3AED);color:#fff;padding:7px 16px;border-radius:8px;text-decoration:none;font-size:12px;font-weight:600'>Télécharger</a>")
+                sb.append("<p style='color:#64748b;margin-bottom:24px'>Nombre de pages converties : <strong>").append(imgs.length).append("</strong></p>");
+                sb.append("<div style='display:flex;flex-direction:column;gap:24px;align-items:center;'>");
+                for(int i=0; i<imgs.length; i++) {
+                    sb.append("<div style='background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:16px;box-shadow:0 4px 6px -1px rgba(0,0,0,0.05);max-width:100%;box-sizing:border-box'>")
+                      .append("<span style='font-size:12px;font-weight:600;color:#64748b;display:block;margin-bottom:8px'>PAGE ").append(i+1).append("</span>")
+                      .append("<img src='data:image/png;base64,").append(imgs[i]).append("' style='max-width:100%;height:auto;border-radius:6px;border:1px solid #f1f5f9;'/>")
                       .append("</div>");
                 }
-                sendHtml(t, resultPage("PDF découpé", "#9D174D", "#FCE7F3", sb.toString()));
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    static class DeleteHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            try {
-                MultipartData mp = parseMultipart(t);
-                int[] pages = parsePages(mp.fields.getOrDefault("pages","1"));
-                sendPdf(t, pdfRef.supprimerPages(mp.files.get("doc"), pages), "sans_pages.pdf");
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    static class ExtractPagesHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            try {
-                MultipartData mp = parseMultipart(t);
-                int[] pages = parsePages(mp.fields.getOrDefault("pages","1"));
-                sendPdf(t, pdfRef.extrairePages(mp.files.get("doc"), pages), "pages_extraites.pdf");
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    static class CompressHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            try {
-                byte[] pdf = parseMultipart(t).files.values().iterator().next();
-                byte[] result = pdfRef.compresserPDF(pdf);
-                long gain = pdf.length - result.length;
-                sendHtml(t, resultPage("PDF compressé", "#0F766E", "#CCFBF1",
-                    "<div style='background:#fff;border:1.5px solid #CCFBF1;border-radius:14px;padding:24px'>"
-                    + "<p style='font-size:11px;font-weight:600;letter-spacing:2px;color:#0F766E;text-transform:uppercase;margin-bottom:16px'>Résultat compression</p>"
-                    + "<div style='display:flex;gap:16px;margin-bottom:20px'>"
-                    + statBox("Taille originale", (pdf.length/1024) + " Ko", "#EDE9FE", "#5B21B6")
-                    + statBox("Taille compressé", (result.length/1024) + " Ko", "#D1FAE5", "#065F46")
-                    + statBox("Gain", (gain/1024) + " Ko", "#FEF3C7", "#92400E")
-                    + "</div>"
-                    + "<a href='data:application/pdf;base64," + Base64.getEncoder().encodeToString(result)
-                    + "' download='compresse.pdf' style='background:linear-gradient(135deg,#059669,#10B981);color:#fff;padding:10px 24px;border-radius:10px;text-decoration:none;font-size:13px;font-weight:600'>Télécharger le PDF compressé</a>"
-                    + "</div>"));
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    static class MetaReadHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            try {
-                byte[] pdf = parseMultipart(t).files.values().iterator().next();
-                String meta = pdfRef.lireMetadonnees(pdf);
-                sendHtml(t, resultPage("Métadonnées", "#3730A3", "#EEF2FF",
-                    "<div style='background:#fff;border:1.5px solid #C7D2FE;border-radius:14px;padding:24px'>"
-                    + "<p style='font-size:11px;font-weight:600;letter-spacing:2px;color:#3730A3;text-transform:uppercase;margin-bottom:16px'>Informations du document</p>"
-                    + "<pre style='white-space:pre-wrap;color:#1E1B4B;font-size:13px;line-height:2;font-family:Inter,sans-serif'>" + escapeHtml(meta) + "</pre>"
-                    + "</div>"));
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    static class MetaModHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            try {
-                MultipartData mp = parseMultipart(t);
-                byte[] result = pdfRef.modifierMetadonnees(
-                    mp.files.get("doc"),
-                    mp.fields.getOrDefault("titre",""),
-                    mp.fields.getOrDefault("auteur",""),
-                    mp.fields.getOrDefault("sujet",""));
-                sendPdf(t, result, "modifie.pdf");
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    static class QRCodeHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            try {
-                MultipartData mp = parseMultipart(t);
-                String contenu = mp.fields.getOrDefault("contenu","https://corba.pdf");
-                int page = Integer.parseInt(mp.fields.getOrDefault("page","0"));
-                int x    = Integer.parseInt(mp.fields.getOrDefault("x","400"));
-                int y    = Integer.parseInt(mp.fields.getOrDefault("y","50"));
-                byte[] result = pdfRef.ajouterQRCode(mp.files.get("doc"), contenu, page, x, y);
-                sendPdf(t, result, "avec_qrcode.pdf");
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    static class SignHandler implements HttpHandler {
-        public void handle(HttpExchange t) throws IOException {
-            if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
-            try {
-                MultipartData mp = parseMultipart(t);
-                byte[] result = pdfRef.signerPDF(
-                    mp.files.get("doc"),
-                    mp.fields.getOrDefault("nom","Signataire"),
-                    mp.fields.getOrDefault("raison","Approbation"),
-                    mp.fields.getOrDefault("lieu","Dakar"));
-                sendPdf(t, result, "signe.pdf");
-            } catch (Exception e) { sendError(t, e.getMessage()); }
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════
-    //  UTILITAIRES
-    // ══════════════════════════════════════════════════════════
-
-    static String statBox(String label, String val, String bg, String color) {
-        return "<div style='flex:1;background:" + bg + ";border-radius:10px;padding:14px;text-align:center'>"
-            + "<p style='font-size:10px;font-weight:600;color:" + color + ";text-transform:uppercase;letter-spacing:1px;margin-bottom:6px'>" + label + "</p>"
-            + "<p style='font-size:20px;font-weight:700;color:" + color + "'>" + val + "</p>"
-            + "</div>";
-    }
-
-    static class MultipartData {
-        Map<String,byte[]> files = new HashMap<>();
-        Map<String,List<byte[]>> fileList = new HashMap<>();
-        Map<String,String> fields = new HashMap<>();
-    }
-
-    static MultipartData parseMultipart(HttpExchange t) throws Exception {
-        MultipartData mp = new MultipartData();
-        String ct = t.getRequestHeaders().getFirst("Content-Type");
-        String boundary = "--" + ct.split("boundary=")[1].trim();
-        byte[] body = readAllBytes(t.getRequestBody());
-        String raw = new String(body, "ISO-8859-1");
-        String[] parts = raw.split(java.util.regex.Pattern.quote(boundary));
-        for (String part : parts) {
-            if (part.trim().isEmpty() || part.equals("--\r\n") || part.equals("--")) continue;
-            int hEnd = part.indexOf("\r\n\r\n");
-            if (hEnd < 0) continue;
-            String headers = part.substring(0, hEnd);
-            String dataRaw = part.substring(hEnd + 4);
-            if (dataRaw.endsWith("\r\n")) dataRaw = dataRaw.substring(0, dataRaw.length() - 2);
-            if (headers.contains("filename=")) {
-                String name = extractHeaderValue(headers, "name");
-                byte[] data = dataRaw.getBytes("ISO-8859-1");
-                mp.files.put(name, data);
-                mp.fileList.computeIfAbsent(name, k -> new ArrayList<>()).add(data);
-            } else if (headers.contains("name=")) {
-                mp.fields.put(extractHeaderValue(headers, "name"), dataRaw.trim());
+                sb.append("</div>");
+                sendHtml(t, resultPage("Conversion PDF en Images", "#2563eb", "#dbeafe", sb.toString()));
+            } catch(Exception e){
+                sendError(t, "Erreur Conversion Images : " + e.getMessage());
             }
         }
-        return mp;
     }
 
-    static String extractHeaderValue(String headers, String key) {
-        for (String line : headers.split("\r\n")) {
-            if (line.contains(key + "=\"")) {
-                int s = line.indexOf(key + "=\"") + key.length() + 2;
-                int e = line.indexOf("\"", s);
-                if (e > s) return line.substring(s, e);
-            }
-        }
-        return "";
-    }
+    // ── PARSEURS ET UTILITAIRES DE RENDU ──────────────────────────────────
 
-    static int[] parsePages(String s) {
-        String[] parts = s.split(",");
-        int[] pages = new int[parts.length];
-        for (int i=0; i<parts.length; i++) pages[i] = Integer.parseInt(parts[i].trim()) - 1;
-        return pages;
-    }
-
-    static Map<String,String> parseQuery(String q) throws Exception {
-        Map<String,String> m = new HashMap<>();
-        if (q==null) return m;
-        for (String s : q.split("&")) {
-            String[] kv = s.split("=",2);
-            if (kv.length>1) m.put(kv[0], URLDecoder.decode(kv[1],"UTF-8"));
-        }
-        return m;
-    }
-
-    static Map<String,String> parseFormBody(String body) throws Exception {
-        Map<String,String> m = new HashMap<>();
-        if (body==null || body.isEmpty()) return m;
-        for (String s : body.split("&")) {
-            String[] kv = s.split("=",2);
-            if (kv.length==2) m.put(URLDecoder.decode(kv[0],"UTF-8"), URLDecoder.decode(kv[1],"UTF-8"));
-        }
-        return m;
-    }
-
-    static byte[] readAllBytes(InputStream is) throws IOException {
+    private static Map<String, String> parseFormData(HttpExchange t) throws IOException {
+        Map<String, String> result = new HashMap<>();
+        InputStream is = t.getRequestBody();
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        byte[] buf = new byte[16384]; int n;
-        while ((n=is.read(buf))!=-1) bos.write(buf,0,n);
-        return bos.toByteArray();
-    }
-
-    static void sendPdf(HttpExchange t, byte[] data, String name) throws IOException {
-        t.getResponseHeaders().set("Content-Type","application/pdf");
-        t.getResponseHeaders().set("Content-Disposition","attachment; filename="+name);
-        t.sendResponseHeaders(200, data.length);
-        t.getResponseBody().write(data);
-        t.getResponseBody().close();
+        byte[] buffer = new byte[1024];
+        int len;
+        while ((len = is.read(buffer)) != -1) {
+            bos.write(buffer, 0, len);
+        }
+        String body = bos.toString(StandardCharsets.UTF_8.name());
+        if(body.isEmpty()) return result;
+        String[] pairs = body.split("&");
+        for (String pair : pairs) {
+            String[] idx = pair.split("=");
+            if (idx.length == 2) {
+                String key = URLDecoder.decode(idx[0], StandardCharsets.UTF_8.name());
+                String value = URLDecoder.decode(idx[1], StandardCharsets.UTF_8.name());
+                result.put(key, value);
+            }
+        }
+        return result;
     }
 
     static void sendHtml(HttpExchange t, String html) throws IOException {
-        byte[] b = html.getBytes("UTF-8");
-        t.getResponseHeaders().set("Content-Type","text/html; charset=UTF-8");
+        byte[] b = html.getBytes(StandardCharsets.UTF_8);
+        t.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
         t.sendResponseHeaders(200, b.length);
-        t.getResponseBody().write(b);
-        t.getResponseBody().close();
+        OutputStream os = t.getResponseBody();
+        os.write(b);
+        os.close();
     }
 
-    static String resultPage(String titre, String color, String bg, String content) {
-        return "<!DOCTYPE html><html lang='fr'><head><meta charset='UTF-8'>"
-            + "<title>" + titre + " - Studio PDF</title>"
-            + "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap' rel='stylesheet'>"
-            + "<style>*{box-sizing:border-box;margin:0;padding:0;font-family:'Inter',sans-serif}"
-            + "body{background:#F5F3FF;min-height:100vh}"
-            + ".topbar{background:linear-gradient(135deg,#4F1D96,#7C3AED);padding:18px 28px;display:flex;align-items:center;gap:16px}"
+    static void sendPdfFile(HttpExchange t, String filename, byte[] data) throws IOException {
+        t.getResponseHeaders().set("Content-Type", "application/pdf");
+        t.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+        t.sendResponseHeaders(200, data.length);
+        OutputStream os = t.getResponseBody();
+        os.write(data);
+        os.close();
+    }
+
+    static String resultPage(String titre, String bg, String color, String content) {
+        return "<html><head><meta charset='UTF-8'><title>" + titre + "</title>"
+            + "<style>"
+            + "body{font-family:'Segoe UI',system-ui,sans-serif;background:#f8fafc;margin:0;color:#0f172a}"
+            + ".topbar{background:#0f172a;padding:16px 32px;display:flex;align-items:center;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1)}"
             + ".topbar a{color:rgba(255,255,255,0.8);text-decoration:none;font-size:13px;font-weight:500}"
             + ".topbar a:hover{color:white}"
-            + ".topbar h2{color:white;font-size:14px;font-weight:600}"
-            + ".content{max-width:860px;margin:0 auto;padding:28px 24px}"
+            + ".topbar h2{color:white;font-size:14px;font-weight:600;margin:0;margin-left:16px;}"
+            + ".content{max-width:860px;margin:0 auto;padding:28px 24px;box-sizing:border-box}"
             + ".result-header{background:" + bg + ";border-radius:12px;padding:14px 18px;margin-bottom:20px}"
             + ".result-header span{font-size:11px;font-weight:600;color:" + color + ";text-transform:uppercase;letter-spacing:1.5px}"
             + "</style></head><body>"
-            + "<div class='topbar'><a href='javascript:history.back()'>&#8592; Retour</a>&nbsp;&nbsp;<h2>" + titre + "</h2></div>"
+            + "<div class='topbar'><a href='javascript:history.back()'>&#8592; Retour</a><h2>" + titre + "</h2></div>"
             + "<div class='content'>"
             + "<div class='result-header'><span>Résultat &mdash; " + titre + "</span></div>"
             + content + "</div></body></html>";
@@ -1033,14 +713,87 @@ public class PDFWebGateway {
 
     static void sendError(HttpExchange t, String msg) throws IOException {
         sendHtml(t, resultPage("Erreur","#991B1B","#FEE2E2",
-            "<div style='background:#fff;border:1.5px solid #FCA5A5;border-radius:12px;padding:24px;text-align:center'>"
-            + "<h3 style='color:#DC2626;margin-bottom:8px;font-size:15px'>Une erreur est survenue</h3>"
-            + "<p style='color:#9CA3AF;font-size:13px'>" + escapeHtml(msg) + "</p>"
-            + "</div>"));
+            "<div style='background:#fff;border:1.5px solid #FCA5A5;border-radius:12px;padding:24px;text-align:left;box-shadow:0 1px 3px rgba(0,0,0,0.05)'>"
+            + "<h3 style='margin:0 0 8px 0;color:#991B1B;font-size:18px;font-weight:600'>Une erreur est survenue</h3>"
+            + "<p style='margin:0;color:#64748b;font-size:14px;line-height:1.5'>" + msg + "</p>"
+            + "</div>"
+        ));
     }
 
-    static String escapeHtml(String s) {
-        if (s==null) return "";
-        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
+    // ── PARSEUR DE MULTIPART (D'ORIGINE) ──────────────────────────────────
+    static class MultipartParser {
+        private final Map<String, byte[]> files = new HashMap<>();
+        private final Map<String, String> fields = new HashMap<>();
+
+        public MultipartParser(HttpExchange t) throws IOException {
+            String contentType = t.getRequestHeaders().getFirst("Content-Type");
+            if (contentType == null || !contentType.contains("multipart/form-data")) return;
+            String boundary = "";
+            for (String param : contentType.split(";")) {
+                if (param.trim().startsWith("boundary=")) {
+                    boundary = param.split("=")[1].trim();
+                }
+            }
+            if (boundary.isEmpty()) return;
+            byte[] boundaryBytes = ("--" + boundary).getBytes(StandardCharsets.UTF_8);
+            InputStream is = t.getRequestBody();
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            int len;
+            while ((len = is.read(buffer)) != -1) { bos.write(buffer, 0, len); }
+            byte[] bodyBytes = bos.toByteArray();
+            int index = 0;
+            while (index < bodyBytes.length) {
+                index = findBytes(bodyBytes, boundaryBytes, index);
+                if (index == -1) break;
+                index += boundaryBytes.length;
+                if (index < bodyBytes.length && bodyBytes[index] == '-' && bodyBytes[index + 1] == '-') break;
+                index += 2; 
+                int headerEnd = findBytes(bodyBytes, new byte[]{13, 10, 13, 10}, index);
+                if (headerEnd == -1) break;
+                String headers = new String(bodyBytes, index, headerEnd - index, StandardCharsets.UTF_8);
+                index = headerEnd + 4;
+                int nextBoundary = findBytes(bodyBytes, boundaryBytes, index);
+                if (nextBoundary == -1) break;
+                int partLength = nextBoundary - index - 2; 
+                byte[] partData = new byte[partLength];
+                System.arraycopy(bodyBytes, index, partData, 0, partLength);
+                parsePart(headers, partData);
+                index = nextBoundary;
+            }
+        }
+
+        private int findBytes(byte[] src, byte[] target, int start) {
+            for (int i = start; i <= src.length - target.length; i++) {
+                boolean found = true;
+                for (int j = 0; j < target.length; j++) {
+                    if (src[i + j] != target[j]) { found = false; break; }
+                }
+                if (found) return i;
+            }
+            return -1;
+        }
+
+        private void parsePart(String headers, byte[] data) throws IOException {
+            String name = "";
+            String filename = "";
+            for (String line : headers.split("\r\n")) {
+                if (line.toLowerCase().startsWith("content-disposition:")) {
+                    for (String param : line.split(";")) {
+                        if (param.trim().startsWith("name=")) {
+                            name = param.split("=")[1].replace("\"", "").trim();
+                        }
+                        if (param.trim().startsWith("filename=")) {
+                            filename = param.split("=")[1].replace("\"", "").trim();
+                        }
+                    }
+                }
+            }
+            if (!filename.isEmpty()) { files.put(name, data); }
+            else { fields.put(name, new String(data, StandardCharsets.UTF_8).trim()); }
+        }
+
+        public byte[] getFile(String name) { return files.get(name); }
+        public String getString(String name) { return fields.get(name); }
     }
 }

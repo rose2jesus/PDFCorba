@@ -1,15 +1,17 @@
 FROM eclipse-temurin:8-jdk
 WORKDIR /app
 
-# Copie d'abord les bibliothèques et le code source
-COPY lib/ ./lib/
 COPY src/ ./src/
-
+COPY lib/ ./lib/
 RUN mkdir -p bin
 
-# AMÉLIORATION : Utilisation de "lib/*" avec des guillemets pour inclure tous les JARs automatiquement
-RUN javac -d bin \
-    -cp "lib/*" \
+# Télécharger les dépendances
+RUN wget -q "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar" -O lib/postgresql-42.7.3.jar && \
+    wget -q "https://repo1.maven.org/maven2/org/mindrot/jbcrypt/0.4/jbcrypt-0.4.jar" -O lib/jbcrypt-0.4.jar && \
+    echo "Deps OK"
+
+# Compilation
+RUN javac -encoding UTF-8 -d bin -cp "lib/*" \
     src/PDFApp/*.java \
     src/PDFServer/PDFServiceImpl.java \
     src/PDFServer/PDFWebGateway.java \
@@ -17,6 +19,9 @@ RUN javac -d bin \
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "orbd -ORBInitialPort 1050 & sleep 3 && \
-     java -cp bin:lib/* PDFServer.StartServer -ORBInitialPort 1050 -ORBInitialHost localhost & sleep 3 && \
-     java -cp bin:lib/* -DDATABASE_URL=$DATABASE_URL PDFServer.PDFWebGateway -ORBInitialPort 1050 -ORBInitialHost localhost"]
+CMD ["sh", "-c", \
+     "orbd -ORBInitialPort 1050 & \
+      sleep 20 && \
+      java -cp bin:lib/* PDFServer.StartServer -ORBInitialPort 1050 -ORBInitialHost localhost & \
+      sleep 30 && \
+      java -cp bin:lib/* PDFServer.PDFWebGateway -ORBInitialPort 1050 -ORBInitialHost localhost"]

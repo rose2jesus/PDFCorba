@@ -3,7 +3,6 @@ package PDFServer;
 import PDFApp.*;
 import org.omg.CORBA.ORB;
 
-import org.apache.pdfbox.cos.*;
 import org.apache.pdfbox.pdmodel.*;
 import org.apache.pdfbox.pdmodel.common.*;
 import org.apache.pdfbox.pdmodel.font.*;
@@ -161,7 +160,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] PDF créé : " + titre);
             return out.toByteArray();
         } catch (Exception e) {
-            throw new PDFException("Erreur création : " + e.getMessage());
+            throw new PDFException("Erreur creation : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }
@@ -181,7 +180,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] Fusion de " + pdfs.length + " PDFs");
             return out.toByteArray();
         } catch (Exception e) {
-            throw new PDFException("Erreur fusion : " + e.getMessage());
+            throw new PDFException("Erreur fusion : " + sanitizeCdrString(e.getMessage()));
         }
     }
 
@@ -210,7 +209,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] PDF découpé en " + result.size() + " parties");
             return result.toArray(new byte[0][]);
         } catch (Exception e) {
-            throw new PDFException("Erreur découpage : " + e.getMessage());
+            throw new PDFException("Erreur decoupage : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }
@@ -238,7 +237,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] " + result.getNumberOfPages() + " page(s) extraite(s)");
             return out.toByteArray();
         } catch (Exception e) {
-            throw new PDFException("Erreur extraction pages : " + e.getMessage());
+            throw new PDFException("Erreur extraction pages : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(result);
             closeQuietly(doc);
@@ -267,7 +266,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] " + pages.length + " page(s) supprimée(s)");
             return out.toByteArray();
         } catch (Exception e) {
-            throw new PDFException("Erreur suppression : " + e.getMessage());
+            throw new PDFException("Erreur suppression : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(result);
             closeQuietly(doc);
@@ -294,7 +293,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] Mot de passe ajouté");
             return out.toByteArray();
         } catch (Exception e) {
-            throw new PDFException("Erreur protection : " + e.getMessage());
+            throw new PDFException("Erreur protection : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }
@@ -319,7 +318,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] PDF converti en " + images.size() + " image(s) à " + dpi + " DPI");
             return images.toArray(new byte[0][]);
         } catch (Exception e) {
-            throw new PDFException("Erreur conversion : " + e.getMessage());
+            throw new PDFException("Erreur conversion : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }
@@ -334,15 +333,42 @@ public class PDFServiceImpl extends PDFServicePOA {
             PDFTextStripper stripper = new PDFTextStripper();
             String texte = stripper.getText(doc);
             if (texte == null || texte.trim().isEmpty()) {
-                return "(Aucun texte extractible — le document est peut-être scanné ou composé uniquement d'images)";
+                return "(Aucun texte extractible - le document est peut-etre scanne ou compose uniquement d'images)";
             }
-            System.out.println("[SERVEUR] Texte extrait : " + texte.length() + " caractères");
-            return texte;
+            System.out.println("[SERVEUR] Texte extrait : " + texte.length() + " caracteres");
+            // CORBA CDR (Java 8) ne peut pas serialiser les String contenant des
+            // caracteres hors Latin-1 (> U+00FF) : on translittere via NFD puis
+            // on supprime tout ce qui reste hors plage.
+            return sanitizeCdrString(texte);
         } catch (Exception e) {
-            throw new PDFException("Erreur extraction texte : " + e.getMessage());
+            throw new PDFException("Erreur extraction texte : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }
+    }
+
+    /**
+     * Rend une String compatible avec la serialisation CDR de CORBA Java 8.
+     * Etape 1 : decomposition NFD pour recuperer la lettre de base des accentes.
+     * Etape 2 : tout caractere encore > U+00FF est remplace par '?'.
+     * Les sauts de ligne et tabulations sont preserves.
+     */
+    private static String sanitizeCdrString(String s) {
+        if (s == null) return "";
+        // NFD decompose e.g. é → e + combining accent ; on garde seulement le char de base
+        String nfd = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD);
+        StringBuilder sb = new StringBuilder(nfd.length());
+        for (int i = 0; i < nfd.length(); i++) {
+            char c = nfd.charAt(i);
+            if (c < 0x0100) {
+                sb.append(c);           // Latin-1 : OK pour CDR
+            } else if (Character.getType(c) == Character.NON_SPACING_MARK) {
+                // accent combinant : on l'ignore (sa lettre de base a deja ete ajoutee)
+            } else {
+                sb.append('?');         // tout le reste : remplacement neutre
+            }
+        }
+        return sb.toString();
     }
 
     // ── 9. Compression ──────────────────────────────────────
@@ -393,7 +419,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] Compression : " + pdf.length + " → " + out.size() + " octets");
             return out.toByteArray();
         } catch (Exception e) {
-            throw new PDFException("Erreur compression : " + e.getMessage());
+            throw new PDFException("Erreur compression : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }
@@ -420,10 +446,10 @@ public class PDFServiceImpl extends PDFServicePOA {
             sb.append("Modifié    : ").append(
                 info.getModificationDate() != null ? info.getModificationDate().getTime() : "Non définie"
             ).append("\n");
-            System.out.println("[SERVEUR] Métadonnées lues");
-            return sb.toString();
+            System.out.println("[SERVEUR] Metadonnees lues");
+            return sanitizeCdrString(sb.toString());
         } catch (Exception e) {
-            throw new PDFException("Erreur lecture métadonnées : " + e.getMessage());
+            throw new PDFException("Erreur lecture metadonnees : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }
@@ -447,7 +473,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] Métadonnées modifiées");
             return out.toByteArray();
         } catch (Exception e) {
-            throw new PDFException("Erreur modification métadonnées : " + e.getMessage());
+            throw new PDFException("Erreur modification metadonnees : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }
@@ -484,7 +510,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] QR Code ajouté page " + pageIndex);
             return out.toByteArray();
         } catch (Exception e) {
-            throw new PDFException("Erreur QR Code : " + e.getMessage());
+            throw new PDFException("Erreur QR Code : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }
@@ -574,7 +600,7 @@ public class PDFServiceImpl extends PDFServicePOA {
             System.out.println("[SERVEUR] PDF signé par " + safeNom);
             return out.toByteArray();
         } catch (Exception e) {
-            throw new PDFException("Erreur signature : " + e.getMessage());
+            throw new PDFException("Erreur signature : " + sanitizeCdrString(e.getMessage()));
         } finally {
             closeQuietly(doc);
         }

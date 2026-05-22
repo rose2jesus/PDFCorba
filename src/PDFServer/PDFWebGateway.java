@@ -299,10 +299,11 @@ public class PDFWebGateway {
     static String modal(String id, String title, String sub, String action, String content) {
         return "<div class='overlay' id='" + id + "'><div class='modal'>"
             + "<h2>" + title + "</h2><p class='msub'>" + sub + "</p>"
-            + "<form method='post' enctype='multipart/form-data' action='" + action + "' onsubmit='showProgress()'>"
+            + "<form method='post' enctype='multipart/form-data' action='" + action
+            + "' onsubmit='return submitWithToken(this)'>"
             + content
             + "<div class='btn-row'>"
-            + "<button class='btn-cancel' type='button' onclick='closeM(\"" + id + "\")'>Annuler</button>"
+            + "<button class='btn-cancel' type='button' onclick='closeM(\"" + id + "\")'> Annuler</button>"
             + "<button class='btn-ok'>Confirmer</button>"
             + "</div></form></div></div>";
     }
@@ -383,23 +384,45 @@ public class PDFWebGateway {
             + "<span class='progress-label'>Traitement en cours...</span>"
             + "</div>"
             + "<script>"
+            + "function getCookie(n){var m=document.cookie.match('(?:^|;)\\s*'+n+'=([^;]*)');return m?decodeURIComponent(m[1]):null;}"
+            + "function deleteCookie(n){document.cookie=n+'=;Path=/;Max-Age=0';}"
+            + "var _pollTimer=null;"
+            + "function showProgress(token){"
+            + "  document.getElementById('progress-overlay').classList.add('active');"
+            + "  if(_pollTimer)clearInterval(_pollTimer);"
+            + "  _pollTimer=setInterval(function(){"
+            + "    if(getCookie('dl_done')===token){deleteCookie('dl_done');hideProgress();}"
+            + "  },300);"
+            + "  setTimeout(function(){hideProgress();},120000);"
+            + "}"
+            + "function hideProgress(){"
+            + "  document.getElementById('progress-overlay').classList.remove('active');"
+            + "  if(_pollTimer){clearInterval(_pollTimer);_pollTimer=null;}"
+            + "}"
+            + "function makeToken(){return Math.random().toString(36).slice(2)+Date.now();}"
             + "function openM(id){document.getElementById(id).classList.add('active')}"
             + "function closeM(id){document.getElementById(id).classList.remove('active')}"
-            + "function showProgress(){document.getElementById('progress-overlay').classList.add('active')}"
+            + "function submitWithToken(form){"
+            + "  var tok=makeToken();"
+            + "  var inp=form.querySelector('input[name=dl_token]');"
+            + "  if(!inp){inp=document.createElement('input');inp.type='hidden';inp.name='dl_token';form.appendChild(inp);}"
+            + "  inp.value=tok;"
+            + "  showProgress(tok);"
+            + "  return true;"
+            + "}"
             + "function validateAndShow(id,input){"
             + "  for(var i=0;i<input.files.length;i++){"
             + "    var f=input.files[i];"
-            + "    if(f.type!='application/pdf'&&!f.name.toLowerCase().endsWith('.pdf')){alert('Seuls les fichiers PDF sont acceptés.');input.value='';return;}"
+            + "    if(f.type!='application/pdf'&&!f.name.toLowerCase().endsWith('.pdf')){alert('Seuls les fichiers PDF sont acceptes.');input.value='';return;}"
             + "    if(f.size>50*1024*1024){alert('Taille max: 50 Mo.');input.value='';return;}"
             + "  }"
-            + "  document.getElementById(id).textContent=input.files.length>1?input.files.length+' fichiers sélectionnés':input.files[0]?input.files[0].name:'Aucun';"
+            + "  document.getElementById(id).textContent=input.files.length>1?input.files.length+' fichiers selectionnes':input.files[0]?input.files[0].name:'Aucun';"
             + "}"
             + "function confirm2(msg,url){if(confirm(msg))window.location.href=url;}"
             + "document.querySelectorAll('.overlay').forEach(function(o){"
             + "  o.addEventListener('click',function(e){if(e.target===this)this.classList.remove('active')})"
             + "});"
-            + "// Fermer le spinner si on revient en arrière (ex: PDF déjà téléchargé)"
-            + "window.addEventListener('pageshow',function(){document.getElementById('progress-overlay').classList.remove('active');});"
+            + "window.addEventListener('pageshow',function(){hideProgress();});"
             + "</script>";
     }
 
@@ -618,13 +641,13 @@ public class PDFWebGateway {
                 + "<div class='card-box'><h2>Créer un PDF</h2>"
                 + "<p class='sub'>Générez instantanément via le serveur CORBA</p>"
                 // FIX: POST au lieu de GET pour éviter la limite d'URL
-                + "<form action='/create' method='post'>"
+                + "<form action='/create' method='post' onsubmit='return submitWithToken(this)'>"
                 + "<div class='inp-row'>"
                 + "<input class='inp' name='titre' placeholder='Titre...' required>"
                 + "<input class='inp' name='auteur' placeholder='Auteur...'>"
                 + "</div>"
                 + "<textarea class='inp' name='corps' placeholder='Contenu du document...'></textarea>"
-                + "<button class='btn-gen' type='submit' onclick='showProgress()'>Générer le PDF</button>"
+                + "<button class='btn-gen' type='submit'>Générer le PDF</button>"
                 + "</form></div>"
                 + "<div class='card-box'><h2>Mes actions récentes</h2>"
                 + buildHistory(username, 5)
@@ -669,10 +692,10 @@ public class PDFWebGateway {
                 + allTools() + "</div>"
                 + "<div class='section-card'><h2>Créer un PDF</h2><p class='sub'>Générez instantanément via le serveur CORBA</p>"
                 // FIX: POST aussi côté admin
-                + "<form action='/create' method='post'>"
+                + "<form action='/create' method='post' onsubmit='return submitWithToken(this)'>"
                 + "<div class='inp-row'><input class='inp' name='titre' placeholder='Titre...' required><input class='inp' name='auteur' placeholder='Auteur...'></div>"
                 + "<textarea class='inp' name='corps' placeholder='Contenu du document...'></textarea>"
-                + "<button class='btn-gen' type='submit' onclick='showProgress()'>Générer le PDF</button>"
+                + "<button class='btn-gen' type='submit'>Générer le PDF</button>"
                 + "</form></div>"
                 + "<div class='section-card'><h2>Historique global</h2><p class='sub'>10 dernières actions</p>"
                 + buildHistory(null, 10) + "</div>"
@@ -748,7 +771,7 @@ public class PDFWebGateway {
                 if (titre.isEmpty()) titre = "Sans titre";
                 byte[] pdf = pdfRef.creerPDF(titre, corps);
                 logAction(getUsername(t), "CRÉATION_PDF", titre);
-                sendPdf(t, pdf, "document.pdf");
+                sendPdf(t, pdf, "document.pdf", p.getOrDefault("dl_token",""));
             } catch (Exception e) { sendError(t, e.getMessage()); }
         }
     }
@@ -757,7 +780,7 @@ public class PDFWebGateway {
         public void handle(HttpExchange t) throws IOException {
             if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
             try {
-                byte[] pdf = parseMultipart(t).files.values().iterator().next();
+                MultipartData mpC = parseMultipart(t); byte[] pdf = mpC.files.values().iterator().next();
                 String texte = pdfRef.extraireTexte(pdf);
                 logAction(getUsername(t), "EXTRACTION_TEXTE", "");
                 sendHtml(t, resultPage("Texte extrait", "#5B21B6", "#EDE9FE",
@@ -801,7 +824,7 @@ public class PDFWebGateway {
                 if (mdp.isEmpty()) throw new Exception("Le mot de passe ne peut pas être vide");
                 byte[] result = pdfRef.ajouterMotDePasse(mp.files.get("doc"), mdp);
                 logAction(getUsername(t), "PROTECTION_PDF", "");
-                sendPdf(t, result, "protected.pdf");
+                sendPdf(t, result, "protected.pdf", mp.fields.getOrDefault("dl_token",""));
             } catch (Exception e) { sendError(t, e.getMessage()); }
         }
     }
@@ -816,7 +839,7 @@ public class PDFWebGateway {
                     throw new Exception("Sélectionnez au moins 2 fichiers PDF");
                 byte[] result = pdfRef.fusionnerPDFs(docs.toArray(new byte[0][]));
                 logAction(getUsername(t), "FUSION_PDF", docs.size() + " fichiers");
-                sendPdf(t, result, "fusion.pdf");
+                sendPdf(t, result, "fusion.pdf", mp.fields.getOrDefault("dl_token",""));
             } catch (Exception e) { sendError(t, e.getMessage()); }
         }
     }
@@ -850,7 +873,7 @@ public class PDFWebGateway {
                 int[] pages = parsePages(mp.fields.getOrDefault("pages", "1"));
                 byte[] result = pdfRef.supprimerPages(mp.files.get("doc"), pages);
                 logAction(getUsername(t), "SUPPRESSION_PAGES", mp.fields.getOrDefault("pages", ""));
-                sendPdf(t, result, "sans_pages.pdf");
+                sendPdf(t, result, "sans_pages.pdf", mp.fields.getOrDefault("dl_token",""));
             } catch (Exception e) { sendError(t, e.getMessage()); }
         }
     }
@@ -863,7 +886,7 @@ public class PDFWebGateway {
                 int[] pages = parsePages(mp.fields.getOrDefault("pages", "1"));
                 byte[] result = pdfRef.extrairePages(mp.files.get("doc"), pages);
                 logAction(getUsername(t), "EXTRACTION_PAGES", mp.fields.getOrDefault("pages", ""));
-                sendPdf(t, result, "pages_extraites.pdf");
+                sendPdf(t, result, "pages_extraites.pdf", mp.fields.getOrDefault("dl_token",""));
             } catch (Exception e) { sendError(t, e.getMessage()); }
         }
     }
@@ -893,7 +916,7 @@ public class PDFWebGateway {
         public void handle(HttpExchange t) throws IOException {
             if (!isLoggedIn(t)) { redirect(t, "/login"); return; }
             try {
-                byte[] pdf = parseMultipart(t).files.values().iterator().next();
+                MultipartData mpM = parseMultipart(t); byte[] pdf = mpM.files.values().iterator().next();
                 String meta = pdfRef.lireMetadonnees(pdf);
                 logAction(getUsername(t), "LECTURE_META", "");
                 sendHtml(t, resultPage("Métadonnées", "#3730A3", "#EEF2FF",
@@ -915,7 +938,7 @@ public class PDFWebGateway {
                     mp.fields.getOrDefault("auteur", ""),
                     mp.fields.getOrDefault("sujet", ""));
                 logAction(getUsername(t), "MODIF_META", mp.fields.getOrDefault("titre", ""));
-                sendPdf(t, result, "modifie.pdf");
+                sendPdf(t, result, "modifie.pdf", mp.fields.getOrDefault("dl_token",""));
             } catch (Exception e) { sendError(t, e.getMessage()); }
         }
     }
@@ -932,7 +955,7 @@ public class PDFWebGateway {
                 int y    = Integer.parseInt(mp.fields.getOrDefault("y", "50"));
                 byte[] result = pdfRef.ajouterQRCode(mp.files.get("doc"), contenu, page, x, y);
                 logAction(getUsername(t), "AJOUT_QRCODE", contenu);
-                sendPdf(t, result, "avec_qrcode.pdf");
+                sendPdf(t, result, "avec_qrcode.pdf", mp.fields.getOrDefault("dl_token",""));
             } catch (Exception e) { sendError(t, e.getMessage()); }
         }
     }
@@ -948,7 +971,7 @@ public class PDFWebGateway {
                     mp.fields.getOrDefault("raison", "Approbation"),
                     mp.fields.getOrDefault("lieu", "Dakar"));
                 logAction(getUsername(t), "SIGNATURE_PDF", mp.fields.getOrDefault("nom", ""));
-                sendPdf(t, result, "signe.pdf");
+                sendPdf(t, result, "signe.pdf", mp.fields.getOrDefault("dl_token",""));
             } catch (Exception e) { sendError(t, e.getMessage()); }
         }
     }
@@ -1153,13 +1176,21 @@ public class PDFWebGateway {
         return bos.toByteArray();
     }
 
-    static void sendPdf(HttpExchange t, byte[] data, String name) throws IOException {
+    static void sendPdf(HttpExchange t, byte[] data, String name, String dlToken) throws IOException {
+        // Poser le cookie dl_done avec le token pour que le JS puisse cacher le spinner
+        if (dlToken != null && !dlToken.isEmpty()) {
+            t.getResponseHeaders().set("Set-Cookie",
+                "dl_done=" + dlToken + "; Path=/; SameSite=Lax; Max-Age=30");
+        }
         t.getResponseHeaders().set("Content-Type", "application/pdf");
         t.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"" + name + "\"");
         t.sendResponseHeaders(200, data.length);
         OutputStream os = t.getResponseBody();
         os.write(data);
         os.close();
+    }
+    static void sendPdf(HttpExchange t, byte[] data, String name) throws IOException {
+        sendPdf(t, data, name, null);
     }
 
     static void sendHtml(HttpExchange t, String html) throws IOException {

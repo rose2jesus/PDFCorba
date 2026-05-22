@@ -3,7 +3,6 @@ package PDFServer;
 import PDFApp.*;
 import org.omg.CORBA.ORB;
 
-import org.apache.pdfbox.cos.*;
 import org.apache.pdfbox.pdmodel.*;
 import org.apache.pdfbox.pdmodel.common.*;
 import org.apache.pdfbox.pdmodel.font.*;

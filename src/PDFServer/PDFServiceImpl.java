@@ -3,7 +3,9 @@ package PDFServer;
 import PDFApp.*;
 import org.omg.CORBA.ORB;
 
+import org.apache.pdfbox.cos.*;
 import org.apache.pdfbox.pdmodel.*;
+import org.apache.pdfbox.pdmodel.graphics.*;
 import org.apache.pdfbox.pdmodel.common.*;
 import org.apache.pdfbox.pdmodel.font.*;
 import org.apache.pdfbox.pdmodel.encryption.*;
@@ -386,7 +388,7 @@ public class PDFServiceImpl extends PDFServicePOA {
                 PDResources res = page.getResources();
                 if (res == null) continue;
                 for (COSName name : res.getXObjectNames()) {
-                    org.apache.pdfbox.pdmodel.graphics.PDXObject xObj;
+                    PDXObject xObj;
                     try { xObj = res.getXObject(name); } catch (Exception ex) { continue; }
                     if (xObj instanceof PDImageXObject) {
                         PDImageXObject img = (PDImageXObject) xObj;

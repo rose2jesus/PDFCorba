@@ -1,0 +1,68 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════
+#  Studio PDF CORBA — Docker Compose (version mono-container)
+#  Architecture : 1 container app (orbd + CORBA + Gateway)
+#                 1 container db  (PostgreSQL)
+#  Pourquoi mono-container pour CORBA ?
+#  → orbd, PDFServiceImpl et PDFWebGateway communiquent via
+#    localhost:1050. Séparer en 3 containers nécessiterait
+#    une config IIOP avancée (endpoints, NAT) non supportée
+#    nativement par l'ORB Java 8.
+# ══════════════════════════════════════════════════════════════
+
+services:
+
+  # ── 1. Base de données PostgreSQL ───────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: pdfcorba_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-pdfcorba}
+      POSTGRES_USER:     ${POSTGRES_USER:-pdfcorba_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pdfcorba_user} -d ${POSTGRES_DB:-pdfcorba}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - pdfcorba_net
+
+  # ── 2. Application complète (orbd + CORBA + Gateway) ────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pdfcorba_app
+    restart: unless-stopped
+    environment:
+      # DATABASE_URL au format postgresql:// — lu par PDFWebGateway
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pdfcorba_user}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-pdfcorba}
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/login || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s   # laisse le temps à orbd + CORBA + gateway de démarrer
+    networks:
+      - pdfcorba_net
+
+# ── Réseau interne ───────────────────────────────────────────
+networks:
+  pdfcorba_net:
+    driver: bridge
+
+# ── Volume persistant PostgreSQL ─────────────────────────────
+volumes:
+  db_data:
+    driver: local
